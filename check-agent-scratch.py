@@ -36,8 +36,10 @@ def fixture_process_check(command, **kwargs):
 
 with tempfile.TemporaryDirectory(dir=args.fixture_parent) as temp:
     base = Path(temp)
+    scratch.HOME = base
     scratch.CONFIG = base / "config" / "config.json"
     scratch.AUDIT_DIR = base / "reports" / "audit"
+    scratch.REPORT = scratch.AUDIT_DIR.parent / "latest.json"
     scratch.ROOT = base / "disposable-scratch"
     scratch.ROOT.mkdir()
     scratch.WORKTREES = base / "worktrees"

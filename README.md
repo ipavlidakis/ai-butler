@@ -42,30 +42,37 @@ while its LaunchAgent is installed.
 - Settings: `~/.config/ai-butler/config.json`. The CLI creates it locally on
   install or the first settings change. Use the CLI to make changes so a
   running sweeper sees them safely and an interval change reloads launchd.
-- Scratch pool: a folder AI Butler scans for disposable jobs. The default is
-  `~/Library/Developer/AgentArtifacts/disposable-scratch/ai-butler/tmp/`.
-  You can use it without adding any paths. Each `ai-butler run` creates a
+- Scratch pool: a folder AI Butler scans for disposable jobs. Run
+  `ai-butler list` to see the path to your default pool. You can use it
+  without adding any paths. Each `ai-butler run` creates a
   fresh job folder there. The sweeper only removes jobs it registered, even
   if something else is stored in the pool.
 - LaunchAgent: `~/Library/LaunchAgents/com.local.ai-butler.plist`.
-- Latest sweep: `~/Library/Developer/AgentArtifacts/admin/ai-butler/latest.json`.
-- Audit history: `~/Library/Developer/AgentArtifacts/admin/ai-butler/audit/`.
+- Latest sweep and audit history: run `ai-butler status` to see their
+  paths. By default, both live in
+  `~/Library/Application Support/AI Butler/State/`.
   Each UTC day gets a separate `YYYY-MM-DD.jsonl` file. Use
   `ai-butler setLogRetention 14` to keep two weeks, for example.
   It records every scheduled sweep and the path, owner, reason, and outcome
   for each deletion. AI Butler writes a durable intent before removing a job.
   To view recent events, run
-  `tail -n 20 ~/Library/Developer/AgentArtifacts/admin/ai-butler/audit/"$(date -u +%F).jsonl"`.
+  `tail -n 20 "$HOME/Library/Application Support/AI Butler/State/audit/$(date -u +%F).jsonl"`.
   An intent without an outcome means there was an interruption; inspect that
   path to see whether it still exists. The audit trail is local and does not
   store a backup of deleted files.
 
-Add another pool only if you want to group jobs separately. For example,
-`ai-butler add "$HOME/Library/Developer/AgentArtifacts/disposable-scratch/ai-butler/checks"`
-registers a new or empty folder; use `ai-butler run --pool checks -- <command>`
-to allocate jobs there. Names start with a lowercase letter and may contain
+Add another pool only if you want to group jobs separately. Run `ai-butler list --json`
+to find the scratch root (`deletion_boundary`), then pass the full path of
+a new or empty folder directly inside it to `ai-butler add`. Use
+`ai-butler run --pool <name> -- <command>` to allocate jobs there. Names
+start with a lowercase letter and may contain
 lowercase letters, digits, and hyphens. `remove` stops watching that folder
 and leaves its contents in place.
+
+If you need a different storage location, set `scratch_root` and/or
+`state_directory` in your local config to separate absolute paths under
+your home directory. Stop the service before changing paths. Changing a root
+does not move or delete existing files.
 
 The configuration, plist, T3 database, and reports are local runtime data. They
 are not part of the repository. The earlier prototype uses a separate label,

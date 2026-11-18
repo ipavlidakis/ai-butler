@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only inventory of managed AgentArtifacts on a T3 host."""
+"""Read-only inventory of managed artifacts on a T3 host."""
 
 import argparse
 from collections import defaultdict
@@ -158,7 +158,7 @@ def report(root, worktrees, t3):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", type=Path, default=Path.home() / "Library/Developer/AgentArtifacts")
+    parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--worktrees", type=Path, default=Path.home() / "workspace/worktrees")
     parser.add_argument("--t3-db", type=Path, default=Path.home() / ".t3/userdata/statev2.sqlite")
     parser.add_argument("--report-file", type=Path, help="Atomically replace a single preview report")

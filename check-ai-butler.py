@@ -22,6 +22,7 @@ spec.loader.exec_module(butler)
 
 with tempfile.TemporaryDirectory(dir=sys.argv[1]) as temporary:
     base = Path(temporary).resolve()
+    butler.HOME = base
     butler.ROOT = base / "scratch"
     butler.CONFIG = base / "config" / "config.json"
     butler.PLIST = base / "agents" / (butler.LABEL + ".plist")
@@ -67,6 +68,16 @@ with tempfile.TemporaryDirectory(dir=sys.argv[1]) as temporary:
         assert json.loads(cli("list", "--json"))["log_retention_days"] == 7
         cli("setLogRetention", 3)
         cli("setLogRetention", 0, code=1)
+        cfg = butler.settings()
+        cfg["scratch_root"] = str(base / "custom-scratch")
+        butler.write_json(butler.CONFIG, cfg)
+        assert json.loads(cli("list", "--json"))["deletion_boundary"] == cfg["scratch_root"]
+        cfg["scratch_root"] = str(base.parent)
+        butler.write_json(butler.CONFIG, cfg)
+        cli("list", "--json", code=1)
+        cfg["scratch_root"] = str(base / "scratch")
+        butler.write_json(butler.CONFIG, cfg)
+        cli("list", "--json")
         assert not changes
         pool = butler.ROOT / "checks"
         cli("add", pool)
@@ -108,7 +119,7 @@ with tempfile.TemporaryDirectory(dir=sys.argv[1]) as temporary:
         assert not expired.exists() and recent.exists() and unrelated.exists() and alias_log.is_symlink()
         assert json.loads(cli("status"))["last_sweep"]["entries"] == []
         events = [json.loads(line) for line in (butler.AUDIT_DIR / f"{today}.jsonl").read_text().splitlines()]
-        assert [entry["event"] for entry in events] == ["sweep_started", "sweep_finished"] * 2
+        assert [entry["event"] for entry in events] == ["sweep_finished", "sweep_started", "sweep_finished"]
         assert events[-2]["sweep_id"] == events[-1]["sweep_id"]
         cli("uninstall")
         cli("uninstall")

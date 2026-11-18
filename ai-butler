@@ -28,15 +28,15 @@ review = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(review)
 
 HOME = Path.home()
-ARTIFACTS = HOME / "Library/Developer/AgentArtifacts"
-ROOT = ARTIFACTS / "disposable-scratch/ai-butler"
+DATA = HOME / "Library/Application Support/AI Butler"
+ROOT = DATA / "Scratch"
 CONFIG = HOME / ".config/ai-butler/config.json"
-REPORT = ARTIFACTS / "admin/ai-butler/latest.json"
+REPORT = DATA / "State/latest.json"
 AUDIT_DIR = REPORT.parent / "audit"
 LABEL = "com.local.ai-butler"
 PLIST = HOME / "Library/LaunchAgents" / (LABEL + ".plist")
 SCRIPT = Path(__file__).resolve()
-SERVICE_COMMAND = ["/usr/bin/python3", str(SCRIPT)]
+SERVICE_COMMAND = ["/usr/bin/python3", str(SCRIPT)]  # The Homebrew formula uses its stable opt path.
 DEFAULT_INTERVAL = 60
 DEFAULT_GRACE = 5
 DEFAULT_RETENTION = 7
@@ -68,6 +68,18 @@ def settings(missing_ok=True):
             or type(retention) is not int or not 1 <= retention <= 36500):
         raise ValueError("Invalid pool or timing settings in " + str(CONFIG))
     return cfg
+
+
+def configure_storage(cfg):
+    global ROOT, REPORT, AUDIT_DIR
+    root = Path(cfg.get("scratch_root", str(ROOT))).expanduser()
+    state = Path(cfg.get("state_directory", str(REPORT.parent))).expanduser()
+    if (not root.is_absolute() or not state.is_absolute()
+            or root.resolve() != root or state.resolve() != state
+            or HOME not in root.parents or HOME not in state.parents
+            or review.overlaps(root, state)):
+        raise ValueError("Scratch and state must be separate canonical directories under your home")
+    ROOT, REPORT, AUDIT_DIR = root, state / "latest.json", state / "audit"
 
 
 def directory(path):
@@ -284,6 +296,11 @@ def sweep(cfg, apply, sweep_id=None):
                                         "allocated_kib": entry["allocated_kib"],
                                         "reason": "finished command, settled T3 threads, grace elapsed, no detected open files"}
                             audit("delete_intent", sweep_id, **evidence)
+                            reason = ready(job, owner, grace)
+                            if reason:
+                                entry["reason"] = reason
+                                audit("delete_cancelled", sweep_id, **dict(evidence, reason=reason))
+                                continue
                             try:
                                 shutil.rmtree(job)
                             except OSError as error:
@@ -336,7 +353,9 @@ def allocate(cfg, options, command_scope):
 def run(options):
     with ExitStack() as command_scope:
         with config_lock(shared=True):
-            job, registration, cmd, fd = allocate(settings(), options, command_scope)
+            cfg = settings()
+            configure_storage(cfg)
+            job, registration, cmd, fd = allocate(cfg, options, command_scope)
         data = job / "data"
         print(f"Disposable scratch: {data}", file=sys.stderr)
         env = dict(os.environ, AGENT_TMP_DIR=str(data), TMPDIR=str(data) + "/")
@@ -462,8 +481,9 @@ def scheduled_sweep():
     sweep_id = uuid.uuid4().hex
     failed = False
     try:
-        audit("sweep_started", sweep_id)
         cfg = settings(missing_ok=False)
+        configure_storage(cfg)
+        audit("sweep_started", sweep_id)
         expire_audit(cfg["log_retention_days"])
         result = sweep(cfg, apply=True, sweep_id=sweep_id)
     except (OSError, ValueError, KeyError, TypeError, RuntimeError,
@@ -507,10 +527,12 @@ def main():
         if action == "run":
             return run(options)
         if action == "status":
+            configure_storage(settings())
             print(json.dumps(status(), indent=2))
             return 0
         if action in ("list", "preview"):
             cfg = settings()
+            configure_storage(cfg)
             result = config_details(cfg) if action == "list" else sweep(cfg, apply=False)
             if action == "list" and not options.json:
                 print(f"Config: {CONFIG}\nSweep: {cfg['interval_minutes']} min; "
@@ -525,6 +547,7 @@ def main():
                 configure_service()
                 return 0
             cfg = settings()
+            configure_storage(cfg)
             if action == "install":
                 ensure_directory(ROOT)
                 if not CONFIG.exists():
