@@ -58,12 +58,28 @@ def load_t3(db):
             ("runs", FINISHED),
             ("runtime_requests", {"resolved", "cancelled"}),
             ("subagents", FINISHED),
-            ("provider_sessions", {"stopped"}),
         ):
             # Table names are fixed above. Unknown statuses conservatively block review.
             active.update(tid for tid, status in conn.execute(
                 f"SELECT thread_id, status FROM orchestration_v2_projection_{table}"
             ) if status not in allowed)
+        # A detached session keeps its last status but loses its thread binding.
+        # T3 counts only live sessions as open, so an unbound session is not active.
+        bound = conn.execute(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'orchestration_v2_projection_provider_session_bindings'"
+        ).fetchone()[0]
+        sessions = (
+            "SELECT sessions.thread_id, bindings.thread_id "
+            "FROM orchestration_v2_projection_provider_sessions AS sessions "
+            "JOIN orchestration_v2_projection_provider_session_bindings AS bindings "
+            "ON bindings.provider_session_id = sessions.provider_session_id "
+            "WHERE sessions.status != 'stopped'"
+        ) if bound else (
+            "SELECT thread_id, NULL FROM orchestration_v2_projection_provider_sessions "
+            "WHERE status != 'stopped'"
+        )
+        active.update(tid for row in conn.execute(sessions) for tid in row if tid is not None)
         legacy = conn.execute(
             "SELECT count(*) FROM projection_threads WHERE deleted_at IS NULL AND worktree_path IS NOT NULL "
             "AND thread_id NOT IN (SELECT thread_id FROM orchestration_v2_projection_threads "

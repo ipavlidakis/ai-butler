@@ -56,8 +56,14 @@ with tempfile.TemporaryDirectory(dir=args.fixture_parent) as temp:
         CREATE TABLE projection_threads(thread_id TEXT, worktree_path TEXT, deleted_at TEXT);
         CREATE TABLE orchestration_v2_projection_threads(thread_id TEXT, payload_json TEXT, deleted_at TEXT);
     """)
-    for table in ("runs", "runtime_requests", "subagents", "provider_sessions"):
+    for table in ("runs", "runtime_requests", "subagents"):
         conn.execute(f"CREATE TABLE orchestration_v2_projection_{table}(thread_id TEXT,status TEXT)")
+    conn.executescript("""
+        CREATE TABLE orchestration_v2_projection_provider_sessions(
+            provider_session_id TEXT, thread_id TEXT, status TEXT);
+        CREATE TABLE orchestration_v2_projection_provider_session_bindings(
+            provider_session_id TEXT, thread_id TEXT);
+    """)
     def register_thread(tid, settled, path=checkout, parent=None):
         conn.execute("DELETE FROM orchestration_v2_projection_threads WHERE thread_id = ?", (tid,))
         conn.execute("INSERT INTO orchestration_v2_projection_threads VALUES (?, ?, NULL)",
@@ -92,6 +98,19 @@ with tempfile.TemporaryDirectory(dir=args.fixture_parent) as temp:
     conn.commit()
     expect(True, "keep", "active")
     conn.execute("DELETE FROM orchestration_v2_projection_runs")
+    # A detached session (ready, no binding) is not live; a bound one is.
+    conn.execute("INSERT INTO orchestration_v2_projection_provider_sessions VALUES ('s1', 'child', 'ready')")
+    conn.commit()
+    expect(False, "eligible")
+    conn.execute("INSERT INTO orchestration_v2_projection_provider_session_bindings VALUES ('s1', 'child')")
+    conn.commit()
+    expect(True, "keep", "active")
+    conn.execute("DROP TABLE orchestration_v2_projection_provider_session_bindings")
+    conn.commit()
+    expect(True, "keep", "active")  # Without the bindings table, every non-stopped session counts.
+    conn.execute("DELETE FROM orchestration_v2_projection_provider_sessions")
+    conn.execute("CREATE TABLE orchestration_v2_projection_provider_session_bindings("
+                 "provider_session_id TEXT, thread_id TEXT)")
     conn.commit()
     with scratch.lock(job):
         expect(True, "keep", "lock")
@@ -285,6 +304,6 @@ with tempfile.TemporaryDirectory(dir=args.fixture_parent) as temp:
     assert "project_cleanup" not in scratch.read_local_json(scratch.CONFIG)
     conn.close()
     os.chdir(base.parent)
-print("PASS: opted-in allocation, settlement, shared checkout, queued run, lock, open file, T3 unavailable, preview, and scoped removal")
+print("PASS: opted-in allocation, settlement, shared checkout, queued run, detached and bound sessions, lock, open file, T3 unavailable, preview, and scoped removal")
 print("PASS: hook-allocated build cache, shared owners, evidence, aliases, audit and resumed threads")
 print("PASS: project stray files: unsafe patterns, owner attribution, orphans, settlement, grace, open file, audit")
