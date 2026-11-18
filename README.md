@@ -3,6 +3,40 @@
 AI Butler is a macOS CLI for disposable scratch owned by T3 jobs. It does not
 manage source worktrees, shared build caches, device state, or existing artifacts.
 
+## What is a scratch pool?
+
+A **scratch pool** is a folder AI Butler checks for temporary job folders.
+The default pool is named `tmp`; you don't need to add one. From a T3 checkout,
+run `ai-butler run -- <command>` to give that command its own folder inside
+the pool. AI Butler sets `TMPDIR` and `AGENT_TMP_DIR` for the command and
+records which T3 thread owns the folder.
+
+AI Butler only cleans up job folders it created and registered. Adding a pool
+doesn't make existing files eligible for cleanup. Commands run outside
+`ai-butler run` do not opt in. Use `ai-butler list` to see your pool paths.
+
+## How cleanup works
+
+```mermaid
+flowchart TD
+    A["From a T3 checkout: ai-butler run -- command"] --> B["Create a temporary job folder in the pool and record its T3 owner"]
+    B --> C["Run the command with its own temp folder"]
+    C --> D["Scheduled sweep checks the job"]
+    D --> E{"Owner verified, command finished, T3 threads settled, grace elapsed, and no open files detected?"}
+    E -->|No or unknown| F["Keep the job folder"]
+    E -->|Yes| G["Record deletion intent"]
+    G -->|Recorded and final checks pass| H["Remove the job folder and record the outcome"]
+    G -->|Check or audit write fails| F
+    F --> I["Record the sweep result"]
+    H --> I
+```
+
+The sweep runs hourly by default. A finished command can still have an
+unsettled T3 thread, so finishing the command alone doesn't trigger deletion.
+Use `ai-butler preview` to see what a sweep would keep or remove.
+
+## Install
+
 Requires macOS, a logged-in user session, Python 3.9 or later, and a local T3
 installation. No Python packages are required.
 
@@ -42,11 +76,6 @@ while its LaunchAgent is installed.
 - Settings: `~/.config/ai-butler/config.json`. The CLI creates it locally on
   install or the first settings change. Use the CLI to make changes so a
   running sweeper sees them safely and an interval change reloads launchd.
-- Scratch pool: a folder AI Butler scans for disposable jobs. Run
-  `ai-butler list` to see the path to your default pool. You can use it
-  without adding any paths. Each `ai-butler run` creates a
-  fresh job folder there. The sweeper only removes jobs it registered, even
-  if something else is stored in the pool.
 - LaunchAgent: `~/Library/LaunchAgents/com.local.ai-butler.plist`.
 - Latest sweep and audit history: run `ai-butler status` to see their
   paths. By default, both live in
