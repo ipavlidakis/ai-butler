@@ -29,7 +29,7 @@ real_run = subprocess.run
 
 
 def fixture_process_check(command, **kwargs):
-    if command[0] == "/usr/sbin/lsof":
+    if command[0] == "/usr/sbin/lsof" and not any(Path(command[-1]).rglob("open-fixture")):
         return subprocess.CompletedProcess(command, 1, b"", b"")
     return real_run(command, **kwargs)
 
@@ -120,6 +120,103 @@ with tempfile.TemporaryDirectory(dir=args.fixture_parent) as temp:
         with patch.object(subprocess, "run", fixture_process_check):
             remove_with_audit()
     assert not job.exists() and (untouched / "keep").exists() and checkout.exists()
+
+    # The startup hook opts in new workspaces; the ordinary build writes to its assigned path.
+    cfg["build_artifacts_root"] = str(base / "artifacts")
+    scratch.write_json(scratch.CONFIG, cfg)
+    legacy = Path(cfg["build_artifacts_root"]) / "workspaces/legacy/unknown"
+    (legacy / "build").mkdir(parents=True)
+    (legacy / "build/keep").touch()
+    scratch.write_json(legacy / "owner.json", {"checkout": str(checkout)})
+    from contextlib import redirect_stdout
+    from io import StringIO
+    output = StringIO()
+    with redirect_stdout(output):
+        assert scratch.artifact_hook(argparse.Namespace(
+            provider="other", cwd=str(checkout), session="fixture")) == 0
+    env = json.loads(output.getvalue())["env"]
+    workspace = Path(env["AGENT_WORKSPACE_ARTIFACTS"])
+    build = workspace / "build"
+    artifact = Path(env["AGENT_XCODE_DIR"]) / "fixture.o"
+    artifact.touch()
+    result = Path(env["AGENT_RESULTS_DIR"]) / "keep.xcresult"
+    result.mkdir()
+    (checkout / ".build").symlink_to(build / "swiftpm", target_is_directory=True)
+
+    def builds(apply, status, reason=None):
+        rows = scratch.sweep(cfg, apply, sweep_id="build-fixture")["entries"]
+        by_path = {row["path"]: row for row in rows}
+        assert by_path[str(legacy / "build")]["status"] == "keep"
+        row = by_path[str(build)]
+        assert row["status"] == status, row
+        if reason:
+            assert reason in row["reason"], row
+        return row
+
+    register_thread("child", None)
+    builds(True, "keep", "not settled")
+    register_thread("child", settled_at)
+    register_thread("indirect", None, None, "child")
+    builds(True, "keep", "not settled")
+    register_thread("indirect", settled_at, None, "child")
+    with patch.object(scratch.review, "load_t3", side_effect=sqlite3.OperationalError("fixture unavailable")):
+        builds(True, "keep", "fixture unavailable")
+    protect = base / "main"
+    protect.mkdir()
+    (protect / "DerivedData").symlink_to(build, target_is_directory=True)
+    conn.execute("INSERT INTO projection_projects VALUES (?,NULL)", (str(protect),))
+    conn.commit()
+    builds(True, "keep", "another T3 checkout")
+    (protect / "DerivedData").unlink()
+    embedded_evidence = artifact.parent / "keep.xcresult"
+    embedded_evidence.mkdir()
+    builds(True, "keep", "test result")
+    embedded_evidence.rmdir()
+    (artifact.parent / "open-fixture").touch()
+    with (artifact.parent / "open-fixture").open():
+        builds(True, "keep", "open files")
+    (artifact.parent / "open-fixture").unlink()
+
+    def remove_build():
+        builds(False, "eligible")
+        with patch.object(scratch, "audit", side_effect=OSError("test audit write failed")):
+            builds(True, "keep", "test audit write failed")
+        with patch.object(scratch, "audit", wraps=scratch.audit) as audit:
+            def resumed(event, sweep_id, **kwargs):
+                if event == "delete_intent":
+                    register_thread("child", None)
+            audit.side_effect = resumed
+            builds(True, "keep", "not settled")
+        register_thread("child", settled_at)
+        old_audit = scratch.audit
+        real_check = scratch.open_or_mounted
+        def resume_after_rename(path, **kwargs):
+            if path.name.startswith(".retired-build-"):
+                register_thread("child", None)
+            return real_check(path, **kwargs)
+        with patch.object(scratch, "open_or_mounted", side_effect=resume_after_rename), \
+                patch.object(scratch, "audit", wraps=old_audit) as audit:
+            builds(True, "keep", "not settled")
+            assert artifact.exists()
+            assert audit.call_args_list[-1].args[0] == "delete_cancelled"
+        register_thread("child", settled_at)
+        row = builds(True, "deleted")
+        assert not Path(row["staged_path"]).exists()
+        events = [json.loads(line) for path in scratch.AUDIT_DIR.glob("*.jsonl")
+                  for line in path.read_text().splitlines()]
+        assert [event["event"] for event in events if event.get("kind") == "build"] == [
+            "delete_intent", "delete_cancelled", "delete_intent", "deleted"]
+    if args.live_lsof:
+        remove_build()
+    else:
+        with patch.object(subprocess, "run", fixture_process_check):
+            remove_build()
+    assert not build.exists() and result.is_dir() and (legacy / "build/keep").exists()
+    assert (workspace / "owner.json").exists() and (checkout / ".build").is_symlink()
+    with redirect_stdout(StringIO()):
+        scratch.artifact_hook(argparse.Namespace(provider="other", cwd=str(checkout), session="fixture"))
+    assert (build / "swiftpm").is_dir() and (checkout / ".build").is_dir()
     conn.close()
     os.chdir(base.parent)
 print("PASS: opted-in allocation, settlement, shared checkout, queued run, lock, open file, T3 unavailable, preview, and scoped removal")
+print("PASS: hook-allocated build cache, shared owners, evidence, aliases, audit and resumed threads")

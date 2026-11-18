@@ -3,14 +3,18 @@
 
 import argparse
 from contextlib import ExitStack, contextmanager
+import ctypes
 from datetime import date, datetime, timedelta, timezone
+import errno
 import fcntl
+import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
 import plistlib
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -183,6 +187,10 @@ def config_lock(shared=False):
         yield
 
 
+def workspace_lock(workspace, nonblocking=False):
+    return lock_file(workspace / ".build-cleanup.lock", os.O_CREAT, nonblocking=nonblocking)
+
+
 def thread_checkout(snapshot, thread, allow_missing=False):
     matches = [path for path, rows in snapshot.threads.items()
                if any(tid == thread for tid, _ in rows)]
@@ -199,22 +207,8 @@ def thread_checkout(snapshot, thread, allow_missing=False):
     return checkout
 
 
-def ready(job, owner, grace):
-    if owner["job"] != job.name or owner["job_identity"] != identity(job):
-        return "registration does not match this directory"
-    data = directory(job / "data")
-    if owner["data_identity"] != identity(data):
-        return "scratch directory has been replaced"
-    if len({path.stat().st_dev for path in (ROOT, job.parent, job, data)}) != 1:
-        return "scratch is on another filesystem"
-    if owner["finished_at"] is None or not owner["finished_at"] <= time.time() - grace:
-        return "command has not finished or is still within the grace period"
-    snapshot = review.load_t3(DB)
-    checkout = thread_checkout(snapshot, owner["thread"], allow_missing=True)
-    if (str(checkout) != owner["checkout"]
-            or checkout.exists() and identity(checkout) != owner["checkout_identity"]):
-        return "T3 checkout no longer matches the registration"
-    related = {owner["thread"]}
+def settled_threads(snapshot, checkout, grace):
+    related = set()
     for path, rows in snapshot.threads.items():
         if review.overlaps(path, checkout):
             related.update(tid for tid, _ in rows)
@@ -241,18 +235,300 @@ def ready(job, owner, grace):
     return None
 
 
-def open_or_mounted(data):
+def ready(job, owner, grace):
+    if owner["job"] != job.name or owner["job_identity"] != identity(job):
+        return "registration does not match this directory"
+    data = directory(job / "data")
+    if owner["data_identity"] != identity(data):
+        return "scratch directory has been replaced"
+    if len({path.stat().st_dev for path in (ROOT, job.parent, job, data)}) != 1:
+        return "scratch is on another filesystem"
+    if owner["finished_at"] is None or not owner["finished_at"] <= time.time() - grace:
+        return "command has not finished or is still within the grace period"
+    snapshot = review.load_t3(DB)
+    checkout = thread_checkout(snapshot, owner["thread"], allow_missing=True)
+    if (str(checkout) != owner["checkout"]
+            or checkout.exists() and identity(checkout) != owner["checkout_identity"]):
+        return "T3 checkout no longer matches the registration"
+    return settled_threads(snapshot, checkout, grace)
+
+
+def open_or_mounted(data, preserve_evidence=False):
     def fail(exc):
         raise exc
     device = data.stat().st_dev
     for base, dirs, files in os.walk(data, followlinks=False, onerror=fail):
         for name in dirs + files:
+            if preserve_evidence and name.endswith((".xcresult", ".xcarchive", ".ipa")):
+                return "build directory contains a test result, archive, or export"
             if (Path(base) / name).lstat().st_dev != device:
                 return "scratch contains another filesystem"
     opened = subprocess.run(["/usr/sbin/lsof", "-nP", "+D", str(data)], capture_output=True, timeout=30)
     if opened.returncode != 1 or opened.stdout or opened.stderr:
         return "open files or incomplete process check"
     return None
+
+
+def build_workspaces(cfg):
+    value = cfg.get("build_artifacts_root")
+    if value is None:
+        return None
+    root = Path(value).expanduser()
+    if (HOME not in root.parents or root.resolve() != root or root == WORKTREES
+            or WORKTREES in root.parents or root in WORKTREES.parents):
+        raise ValueError("Build artifact root must be canonical and separate from worktrees")
+    managed = root / "workspaces"
+    if any(review.overlaps(managed, path) for path in (ROOT, REPORT.parent, T3_SCRATCH)):
+        raise ValueError("Build workspaces overlap scratch, state, or T3 storage")
+    return managed
+
+
+def build_checkout(workspace, owner):
+    checkout = Path(owner["checkout"])
+    if (WORKTREES not in checkout.parents or checkout.resolve() != checkout
+            or len(checkout.relative_to(WORKTREES).parts) != 2
+            or workspace.name != hashlib.sha256(str(checkout).encode()).hexdigest()[:16]):
+        raise ValueError("Ownership does not match a canonical managed worktree")
+    return checkout
+
+
+def artifact_hook(options):
+    payload = json.load(sys.stdin) if options.provider != "other" and not options.cwd else {}
+    provider = options.provider
+    if provider == "claude" and (payload.get("cursor_version") or os.getenv("CURSOR_VERSION")):
+        provider = "cursor"
+    roots = payload.get("workspace_roots") or []
+    cwd = Path(options.cwd or payload.get("cwd") or (roots[0] if roots else Path.cwd()))
+    cwd = cwd.resolve(strict=True)
+    if not cwd.is_dir():
+        raise ValueError("Hook checkout must be a directory")
+    checkout = next((p for p in (cwd, *cwd.parents) if (p / ".git").exists()), cwd)
+    session = (options.session or payload.get("session_id")
+               or payload.get("conversation_id") or uuid.uuid4().hex)
+    with ExitStack() as scope:
+        managed = build_workspaces(settings(missing_ok=False))
+        if managed is None:
+            raise ValueError("Artifact hooks are not configured")
+        name = re.sub(r"[^a-zA-Z0-9._-]+", "-", checkout.name).strip(".-")[:48] or "workspace"
+        workspace = ensure_directory(managed / name / hashlib.sha256(str(checkout).encode()).hexdigest()[:16])
+        scope.enter_context(workspace_lock(workspace))
+        marker = workspace / "owner.json"
+        if not marker.exists() and not marker.is_symlink():
+            if any(path.name != ".build-cleanup.lock" for path in workspace.iterdir()):
+                raise ValueError("Existing workspace has no ownership record")
+            owner = {"checkout": str(checkout), "created_at": datetime.now(timezone.utc).isoformat(),
+                     "retention": "protected-until-explicit-review"}
+            if (WORKTREES in checkout.parents and len(checkout.relative_to(WORKTREES).parts) == 2):
+                owner["build_cleanup"] = {"version": 1, "workspace_identity": identity(workspace),
+                                          "checkout_identity": identity(checkout)}
+            write_json(marker, owner)
+        elif read_local_json(marker)["checkout"] != str(checkout):
+            raise ValueError("Artifact workspace has a different owner")
+        run_dir = ensure_directory(workspace / "runs" / (
+            provider + "-" + hashlib.sha256(session.encode()).hexdigest()[:16]))
+        run_owner = run_dir / "owner.json"
+        if not run_owner.exists() and not run_owner.is_symlink():
+            write_json(run_owner, {"checkout": str(checkout), "provider": provider, "session_id": session,
+                                   "created_at": datetime.now(timezone.utc).isoformat(),
+                                   "retention": "protected-until-explicit-review"})
+        else:
+            data = read_local_json(run_owner)
+            if (data["checkout"], data["provider"], data["session_id"]) != (str(checkout), provider, session):
+                raise ValueError("Artifact run has a different owner")
+        env = {"AGENT_ARTIFACTS_ROOT": str(managed.parent), "AGENT_CHECKOUT": str(checkout),
+               "AGENT_WORKSPACE_ARTIFACTS": str(workspace), "AGENT_RUN_DIR": str(run_dir)}
+        for key, path in (("XCODE", workspace / "build/xcode"),
+                          ("SWIFTPM", workspace / "build/swiftpm"),
+                          ("LOG", run_dir / "logs"), ("RESULTS", run_dir / "results"),
+                          ("SCREENSHOTS", run_dir / "screenshots"), ("TMP", run_dir / "tmp")):
+            env[f"AGENT_{key}_DIR"] = str(ensure_directory(path))
+        env_file = run_dir / "env.sh"
+        content = "".join(f"export {key}={shlex.quote(value)}\n" for key, value in env.items())
+        write_file(env_file, content.encode())
+    context = (f"Source {shlex.quote(str(env_file))} before building. "
+               "Use the assigned DerivedData or SwiftPM scratch path and keep evidence in the run directory.")
+    if options.provider == "claude" and provider == "claude" and os.getenv("CLAUDE_ENV_FILE"):
+        with open(os.environ["CLAUDE_ENV_FILE"], "a") as stream:
+            stream.write("\n" + content)
+    if options.provider == "cursor":
+        output = {"env": env, "additional_context": context}
+    elif provider in ("codex", "claude"):
+        output = {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": context}}
+    else:
+        output = {"env_file": str(env_file), "env": env, "context": context}
+    print(json.dumps(output))
+    return 0
+
+
+def hook_updates():
+    changes = []
+    for provider, relative in (("codex", ".codex/hooks.json"), ("claude", ".claude/settings.json"),
+                               ("cursor", ".cursor/hooks.json")):
+        path = HOME / relative
+        if not path.parent.is_dir():
+            continue
+        try:
+            data = read_local_json(path)
+        except FileNotFoundError:
+            data = {"version": 1} if provider == "cursor" else {}
+        hooks = data.setdefault("hooks", {}).setdefault(
+            "sessionStart" if provider == "cursor" else "SessionStart", [])
+        command = shlex.join([*SERVICE_COMMAND, "artifact-hook", provider])
+        legacy = shlex.join(["/usr/bin/python3", str(HOME / ".agents/hooks/artifact-storage.py"), provider])
+        matches = [hook for group in hooks
+                   for hook in ([group] if provider == "cursor" else group.get("hooks", []))
+                   if hook.get("command") in (command, legacy)]
+        if len(matches) > 1:
+            raise ValueError(f"Multiple artifact hooks in {path}; keep just one before installing")
+        if matches and matches[0]["command"] == command:
+            continue
+        if matches:
+            matches[0]["command"] = command
+        elif provider == "cursor":
+            hooks.append({"command": command, "timeout": 5})
+        else:
+            hooks.append({"hooks": [{"type": "command", "command": command, "timeout": 5}]})
+        changes.append((path, data))
+    return changes
+
+
+def check_build(workspace, path, expected, owner, grace):
+    if identity(path) != expected or path.stat().st_dev != workspace.stat().st_dev:
+        return "build directory was replaced or is on another filesystem"
+    if read_local_json(workspace / "owner.json") != owner:
+        return "build ownership changed"
+    checkout = build_checkout(workspace, owner)
+    if checkout.exists() and identity(checkout) != owner["build_cleanup"]["checkout_identity"]:
+        return "worktree has been replaced"
+    for entry in path.iterdir():
+        if entry.name not in {"xcode", "swiftpm", "native"} or not review.directory(entry):
+            return "unrecognized output in the build directory"
+    snapshot = review.load_t3(DB)
+    if snapshot.has_unmapped_legacy_threads or not snapshot.threads.get(checkout):
+        return "no complete T3 ownership for this worktree"
+    if any(review.overlaps(checkout, p) for p in snapshot.projects):
+        return "worktree overlaps a project checkout"
+    if any(review.overlaps(workspace, p) for p in (*snapshot.projects, *snapshot.threads)):
+        return "build storage overlaps a T3 checkout"
+    for protected in (*snapshot.projects, *snapshot.threads):
+        if protected == checkout or not protected.exists():
+            continue
+        for alias in (protected / ".build", protected / "DerivedData"):
+            if alias.is_symlink() and review.overlaps(workspace / "build", alias.resolve()):
+                return "another T3 checkout refers to this build directory"
+    return settled_threads(snapshot, checkout, grace)
+
+
+def restore_build(parked, build):
+    rename = ctypes.CDLL(None, use_errno=True).renamex_np
+    rename.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+    if rename(os.fsencode(parked), os.fsencode(build), 0x00000004) == 0:  # RENAME_EXCL
+        return True
+    code = ctypes.get_errno()
+    if code == errno.EEXIST:
+        return False
+    raise OSError(code, os.strerror(code), str(parked), str(build))
+
+
+def sweep_builds(cfg, apply, sweep_id, entries):
+    managed = build_workspaces(cfg)
+    if managed is None or not managed.exists():
+        return
+    directory(managed)
+    for workspace in sorted(managed.glob("*/*")):
+        build = workspace / "build"
+        if not review.directory(workspace):
+            continue
+        for parked in sorted(workspace.glob(".retired-build-*")):
+            entries.append({"kind": "build", "path": str(parked), "status": "staged",
+                            "reason": "interrupted cleanup; preserved for manual review"})
+        if not build.exists() and not build.is_symlink():
+            continue
+        entry = {"kind": "build", "path": str(build), "status": "keep"}
+        entries.append(entry)
+        try:
+            inspect_build(cfg, apply, sweep_id, workspace, build, entry)
+        except BlockingIOError:
+            entry["reason"] = "artifact setup holds the workspace lock"
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError,
+                review.sqlite3.Error, subprocess.SubprocessError) as exc:
+            entry["reason"] = str(exc)
+
+
+def inspect_build(cfg, apply, sweep_id, workspace, build, entry):
+    with ExitStack() as scope:
+        directory(workspace)
+        owner = read_local_json(workspace / "owner.json")
+        marker = owner.get("build_cleanup")
+        if not isinstance(marker, dict) or marker.get("version") != 1:
+            entry["reason"] = "build output was not opted in at allocation"
+            return
+        if apply:
+            # Only hold the workspace lock for the final rename and validation.
+            # Preliminary inspection can be slow and does not change the workspace.
+            guard = workspace / ".build-cleanup.lock"
+            if not guard.is_file() or guard.is_symlink():
+                raise ValueError("Missing artifact workspace lock")
+        if marker["workspace_identity"] != identity(workspace):
+            raise ValueError("build registration does not match its workspace")
+        entry["checkout"] = owner["checkout"]
+        expected = identity(build)
+        grace = cfg["settlement_grace_seconds"]
+        reason = check_build(workspace, build, expected, owner, grace)
+        if not reason:
+            reason = open_or_mounted(build, preserve_evidence=True)
+        if reason:
+            entry["reason"] = reason
+            return
+        entry["allocated_kib"] = review.size_kib(build)
+        if not apply:
+            entry["status"] = "eligible"
+            return
+        if not sweep_id:
+            raise ValueError("Deletion requires a sweep audit ID")
+        parked = workspace / (".retired-build-" + uuid.uuid4().hex)
+        evidence = {"kind": "build", "path": str(build), "checkout": entry["checkout"],
+                    "staged_path": str(parked), "allocated_kib": entry["allocated_kib"],
+                    "reason": "all T3 owners settled and no detected open files"}
+        scope.enter_context(lock_file(guard))
+        reason = check_build(workspace, build, expected, owner, grace)
+        if reason:
+            entry["reason"] = reason
+            return
+        audit("delete_intent", sweep_id, **evidence)
+        reason = check_build(workspace, build, expected, owner, grace)
+        if reason:
+            entry["reason"] = reason
+            audit("delete_cancelled", sweep_id, **dict(evidence, reason=reason))
+            return
+        # shortcut: T3 has no cross-process startup lock; detach the old generation
+        # so a resumed build can only recreate the original path, not write into it.
+        build.rename(parked)
+        entry["staged_path"] = str(parked)
+        entry["status"] = "staged"
+        try:
+            reason = (open_or_mounted(parked, preserve_evidence=True)
+                      or check_build(workspace, parked, expected, owner, grace)
+                      or ("build was recreated" if build.exists() or build.is_symlink() else None))
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError,
+                review.sqlite3.Error, subprocess.SubprocessError) as exc:
+            reason = str(exc)
+        if reason:
+            entry["reason"] = reason
+            if restore_build(parked, build):
+                entry["status"] = "keep"
+                entry.pop("staged_path")
+            audit("delete_cancelled", sweep_id, **dict(evidence, reason=reason))
+            return
+        scope.close()
+        try:
+            shutil.rmtree(parked)
+        except OSError as exc:
+            entry["reason"] = str(exc)
+            audit("delete_failed", sweep_id, **dict(evidence, reason=str(exc)))
+            return
+        entry["status"] = "deleted"
+        audit("deleted", sweep_id, **evidence)
 
 
 def sweep(cfg, apply, sweep_id=None):
@@ -316,6 +592,7 @@ def sweep(cfg, apply, sweep_id=None):
             except (OSError, ValueError, KeyError, TypeError, RuntimeError,
                     review.sqlite3.Error, subprocess.SubprocessError) as exc:
                 entry["reason"] = str(exc)
+    sweep_builds(cfg, apply, sweep_id, result["entries"])
     return result
 
 
@@ -463,7 +740,8 @@ def config_details(cfg):
             "interval_minutes": cfg["interval_minutes"],
             "settlement_grace_minutes": cfg["settlement_grace_seconds"] // 60,
             "launch_agent": str(PLIST), "latest_sweep_file": str(REPORT),
-            "audit_directory": str(AUDIT_DIR), "log_retention_days": cfg["log_retention_days"]}
+            "audit_directory": str(AUDIT_DIR), "log_retention_days": cfg["log_retention_days"],
+            "build_artifacts_root": cfg.get("build_artifacts_root")}
 
 
 def status():
@@ -506,13 +784,20 @@ def main():
     listing.add_argument("--json", action="store_true")
     commands.add_parser("add", help="Register a new or empty pool").add_argument("path")
     commands.add_parser("remove", help="Unregister a pool without deleting it").add_argument("path")
-    commands.add_parser("install", help="Install or load the user LaunchAgent")
+    install = commands.add_parser("install", help="Install or load the user LaunchAgent")
+    install.add_argument("--hooks", action="store_true", help="Also configure agent startup hooks")
+    install.add_argument("--artifact-root", type=Path,
+                         help="Local artifact storage for --hooks")
     commands.add_parser("uninstall", help="Unload and remove the LaunchAgent")
     commands.add_parser("setInterval", help="Set sweep interval in minutes (0 resets to 60)").add_argument("minutes", type=int)
     commands.add_parser("setSettlementGracePeriod", help="Set settlement grace in minutes").add_argument("minutes", type=int)
     commands.add_parser("setLogRetention", help="Set audit retention in days (default 7)").add_argument("days", type=int)
     commands.add_parser("preview", help="Show current eligibility; remove nothing")
     commands.add_parser("status", help="Show LaunchAgent and last sweep status")
+    hook = commands.add_parser("artifact-hook", help="Allocate workspace and run output paths")
+    hook.add_argument("provider", choices=("codex", "claude", "cursor", "other"))
+    hook.add_argument("--cwd")
+    hook.add_argument("--session")
     foreground = commands.add_parser("run", help="Run one foreground command with disposable temp")
     foreground.add_argument("--thread")
     foreground.add_argument("--pool")
@@ -524,6 +809,8 @@ def main():
                 return scheduled_sweep()
         options = parser.parse_args()
         action = options.action
+        if action == "artifact-hook":
+            return artifact_hook(options)
         if action == "run":
             return run(options)
         if action == "status":
@@ -538,6 +825,8 @@ def main():
                 print(f"Config: {CONFIG}\nSweep: {cfg['interval_minutes']} min; "
                       f"settlement grace: {cfg['settlement_grace_seconds'] // 60} min")
                 print(f"Audit logs: {AUDIT_DIR} ({cfg['log_retention_days']} days)")
+                if cfg.get("build_artifacts_root"):
+                    print(f"Build artifacts: {cfg['build_artifacts_root']}")
                 print("\n".join(result["pools"]) or "(no pools configured)")
             else:
                 print(json.dumps(result, indent=2))
@@ -549,10 +838,27 @@ def main():
             cfg = settings()
             configure_storage(cfg)
             if action == "install":
+                if options.artifact_root is not None and not options.hooks:
+                    raise ValueError("--artifact-root requires --hooks")
                 ensure_directory(ROOT)
-                if not CONFIG.exists():
+                if options.hooks:
+                    current = cfg.get("build_artifacts_root")
+                    selected = options.artifact_root or Path(current or DATA / "Artifacts")
+                    selected = str(selected.expanduser())
+                    if current and current != selected:
+                        raise ValueError("Stop the service and edit build_artifacts_root to change storage")
+                    cfg["build_artifacts_root"] = selected
+                    ensure_directory(build_workspaces(cfg))
+                    changes = hook_updates()
                     write_json(CONFIG, cfg)
-                configure_service(cfg["interval_minutes"])
+                    configure_service(cfg["interval_minutes"])
+                    for path, data in changes:
+                        write_json(path, data)
+                    print("Startup hooks installed. Trust the new Codex hook in /hooks if prompted.")
+                else:
+                    if not CONFIG.exists():
+                        write_json(CONFIG, cfg)
+                    configure_service(cfg["interval_minutes"])
             elif action in ("add", "remove"):
                 configure_pool(cfg, options.path, action == "add")
             elif action == "setLogRetention":

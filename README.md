@@ -1,7 +1,8 @@
 # AI Butler
 
-AI Butler is a macOS CLI for disposable scratch owned by T3 jobs. It does not
-manage source worktrees, shared build caches, device state, or existing artifacts.
+AI Butler is a macOS CLI that cleans up temporary files and, with startup
+hooks enabled, build output owned by T3 worktrees. Source worktrees, shared
+caches, device state, and older unregistered data stay outside its scope.
 
 ## What is a scratch pool?
 
@@ -35,6 +36,41 @@ The sweep runs hourly by default. A finished command can still have an
 unsettled T3 thread, so finishing the command alone doesn't trigger deletion.
 Use `ai-butler preview` to see what a sweep would keep or remove.
 
+## Worktree build cleanup
+
+`ai-butler install --hooks` registers the artifact startup hook for Codex,
+Claude Code, and Cursor when their configuration directories exist. If Codex
+asks you to trust the new hook, review it in `/hooks`. Start a fresh agent
+session after installing. Plain `install` does not change provider settings.
+
+The hook creates an `owner.json` that records the checkout path, and an
+`env.sh` with a shared build path for that checkout and separate evidence
+paths for each run. Source that file as instructed by the hook and use the
+build tool's output settings. You do not wrap normal builds in `ai-butler run`
+or mark paths by hand. When the last T3 thread for the worktree settles and the
+grace period passes, the next sweep checks for active work and open files
+before retiring the build cache. A completed command alone is not enough.
+
+For example:
+
+- **Make and RepoCLI:** If the wrapper already uses the assigned agent paths
+  (as Vesputio does), keep running the same Make commands.
+- **Xcode and Fastlane:** Route DerivedData to a toolchain-specific directory
+  in `AGENT_XCODE_DIR` and results to `AGENT_RESULTS_DIR`. For Fastlane Scan,
+  `SCAN_DERIVED_DATA_PATH` and `SCAN_OUTPUT_DIRECTORY` can set this in a local
+  wrapper when the lane does not pass explicit values.
+- **GN and Ninja:** Use the existing build output option to route disposable
+  output into `$AGENT_WORKSPACE_ARTIFACTS/build/native` if the tool supports
+  it. For a Make wrapper that supports `OUT` and `PRODUCTS`, put `OUT`
+  there and set `PRODUCTS` to a separate evidence or delivery path. Keep
+  packages and deliverables outside the build directory.
+
+Only workspaces newly allocated by this hook can opt in. The sweeper uses
+the T3 worktree root at `~/workspace/worktrees` and leaves older workspaces,
+main checkouts, run results, and retained deliverables alone. Set a private
+storage location with `install --hooks --artifact-root <path>`, or use the
+default under macOS Application Support. Use `preview` to inspect eligibility.
+
 ## Install
 
 Requires macOS, a logged-in user session, Python 3.9 or later, and a local T3
@@ -63,6 +99,7 @@ while its LaunchAgent is installed.
 | `add <path>` | Register a new or empty pool under the dedicated disposable root. Never adopt an arbitrary path or existing files. |
 | `remove <path>` | Stop allocating and sweeping that pool. Leave the directory and its contents on disk. |
 | `install` | Create and load the user's LaunchAgent if needed. Running it twice is safe. |
+| `install --hooks` | Also wire provider startup hooks and opt in new worktree build caches. |
 | `uninstall` | Unload and remove the LaunchAgent. Keep the configuration and disk data. |
 | `setInterval <minutes>` | Change the sweep interval. `0` restores the default of 60 minutes. Reload the installed service to apply it. |
 | `setSettlementGracePeriod <minutes>` | Change the minimum time after both the foreground command finishes and T3 settles its thread. Keep the prototype's five-minute default. If work resumes, recalculate eligibility from the new settlement. |
@@ -70,6 +107,7 @@ while its LaunchAgent is installed.
 | `run [--thread <id>] [--pool <name>] -- <command>` | From the T3 checkout, opt in one foreground command. Uses `T3CODE_THREAD_ID` by default. |
 | `preview` | List what a sweep would keep or remove, with reasons, without deleting data. |
 | `status` | Show whether the LaunchAgent is loaded and the time and outcome of its last sweep. |
+| `artifact-hook other --cwd <path> --session <id>` | Allocate paths manually for a provider without a startup hook. |
 
 ## Local settings and data
 
@@ -109,7 +147,7 @@ config, and pool. This tool does not migrate that installation.
 
 ## Cleanup rules
 
-`run` supplies `TMPDIR` and `AGENT_TMP_DIR` to the foreground command. Don't
+For disposable scratch, `run` supplies `TMPDIR` and `AGENT_TMP_DIR` to the foreground command. Don't
 store deliverables there, hand paths to detached jobs, or reuse the paths in
 later commands. AI Butler only removes paths it allocated in a registered
 pool. It checks read-only local T3 state, waits for settlement and command
@@ -118,6 +156,11 @@ unrecognized jobs. If it cannot read the T3 schema or match a thread, it keeps
 the data. Missing configuration disables scheduled cleanup. A command
 interrupted before its completion can be recorded is also kept. T3 remains
 responsible for source worktree removal.
+
+Build cleanup keeps its audit trail outside the build directory. It renames
+the old cache out of the way before the final check so a new build can use
+the original path. If a check fails and the original path has been recreated,
+the old cache is kept and reported as staged for manual review.
 
 ## Checks
 

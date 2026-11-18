@@ -125,6 +125,27 @@ with tempfile.TemporaryDirectory(dir=sys.argv[1]) as temporary:
         cli("uninstall")
         assert live is None and not butler.PLIST.exists()
         assert (pool / "keep").exists() and butler.CONFIG.exists()
+        other_hook = {"type": "command", "command": "keep-existing-hook"}
+        for folder in (".codex", ".claude", ".cursor"):
+            (base / folder).mkdir()
+        codex = base / ".codex/hooks.json"
+        claude = base / ".claude/settings.json"
+        cursor = base / ".cursor/hooks.json"
+        legacy_hook = {"type": "command", "timeout": 5, "command":
+                       f"/usr/bin/python3 {base}/.agents/hooks/artifact-storage.py codex"}
+        butler.write_json(codex, {"hooks": {"SessionStart": [{"hooks": [legacy_hook, other_hook]}]}})
+        butler.write_json(claude, {"permissions": {"allow": ["fixture"]}})
+        butler.write_json(cursor, {"version": 1, "hooks": {"sessionStart": [{"command": "keep"}]}})
+        cli("install", "--hooks", "--artifact-root", base / "artifacts")
+        assert not butler.hook_updates()
+        cli("install", "--hooks")
+        assert butler.settings()["build_artifacts_root"] == str(base / "artifacts")
+        hooks = butler.read_local_json(codex)["hooks"]["SessionStart"][0]["hooks"]
+        assert len(hooks) == 2 and hooks[1] == other_hook
+        assert hooks[0]["command"].endswith("artifact-hook codex")
+        assert butler.read_local_json(claude)["permissions"] == {"allow": ["fixture"]}
+        assert len(butler.read_local_json(cursor)["hooks"]["sessionStart"]) == 2
+        cli("uninstall")
         butler.PLIST.write_bytes(plistlib.dumps({"Label": "other"}))
         cli("uninstall", code=1)
         assert butler.PLIST.exists()
