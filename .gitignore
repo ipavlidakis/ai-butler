@@ -8,4 +8,5 @@ config.json
 *.sqlite*
 *.plist
 *.log
+*.jsonl
 latest.json

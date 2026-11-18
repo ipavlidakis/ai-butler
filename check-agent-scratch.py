@@ -37,6 +37,7 @@ def fixture_process_check(command, **kwargs):
 with tempfile.TemporaryDirectory(dir=args.fixture_parent) as temp:
     base = Path(temp)
     scratch.CONFIG = base / "config" / "config.json"
+    scratch.AUDIT_DIR = base / "reports" / "audit"
     scratch.ROOT = base / "disposable-scratch"
     scratch.ROOT.mkdir()
     scratch.WORKTREES = base / "worktrees"
@@ -73,7 +74,7 @@ with tempfile.TemporaryDirectory(dir=args.fixture_parent) as temp:
     owner["finished_at"] = time.time() - 90
     scratch.write_json(job / "owner.json", owner)
     def expect(mode, status, reason=None):
-        row, = scratch.sweep(cfg, mode)["entries"]
+        row, = scratch.sweep(cfg, mode, sweep_id="fixture")["entries"]
         assert row["status"] == status, row
         if reason:
             assert reason in row["reason"], row
@@ -101,15 +102,21 @@ with tempfile.TemporaryDirectory(dir=args.fixture_parent) as temp:
     untouched.mkdir()
     (untouched / "keep").touch()
     (data / "alias").symlink_to(untouched)
-    if args.live_lsof:
+    def remove_with_audit():
         expect(False, "eligible")
+        with patch.object(scratch, "audit", side_effect=OSError("test audit write failed")):
+            expect(True, "keep", "test audit write failed")
         assert job.exists()
         expect(True, "deleted")
+        events = [json.loads(line) for path in sorted(scratch.AUDIT_DIR.glob("*.jsonl"))
+                  for line in path.read_text().splitlines()]
+        assert [event["event"] for event in events] == ["delete_intent", "deleted"]
+        assert all(event["path"] == str(job) and event["thread"] == "demo" for event in events)
+    if args.live_lsof:
+        remove_with_audit()
     else:
         with patch.object(subprocess, "run", fixture_process_check):
-            expect(False, "eligible")
-            assert job.exists()
-            expect(True, "deleted")
+            remove_with_audit()
     assert not job.exists() and (untouched / "keep").exists() and checkout.exists()
     conn.close()
     os.chdir(base.parent)

@@ -2,6 +2,7 @@
 """Exercise the CLI and its launchd operations without installing a real service."""
 
 from contextlib import redirect_stdout, redirect_stderr
+from datetime import datetime, timedelta, timezone
 import importlib.util
 from importlib.machinery import SourceFileLoader
 import io
@@ -25,6 +26,7 @@ with tempfile.TemporaryDirectory(dir=sys.argv[1]) as temporary:
     butler.CONFIG = base / "config" / "config.json"
     butler.PLIST = base / "agents" / (butler.LABEL + ".plist")
     butler.REPORT = base / "reports" / "latest.json"
+    butler.AUDIT_DIR = butler.REPORT.parent / "audit"
     live = None
     fail_interval = None
     changes = []
@@ -62,6 +64,9 @@ with tempfile.TemporaryDirectory(dir=sys.argv[1]) as temporary:
         assert not butler.CONFIG.exists()
         cli("setInterval", 8)
         cli("setSettlementGracePeriod", 2)
+        assert json.loads(cli("list", "--json"))["log_retention_days"] == 7
+        cli("setLogRetention", 3)
+        cli("setLogRetention", 0, code=1)
         assert not changes
         pool = butler.ROOT / "checks"
         cli("add", pool)
@@ -91,8 +96,20 @@ with tempfile.TemporaryDirectory(dir=sys.argv[1]) as temporary:
         fail_interval = 180
         cli("setInterval", 3, code=1)
         assert live["StartInterval"] == 3600 and butler.settings()["interval_minutes"] == 60
+        today = datetime.now(timezone.utc).date()
+        recent = butler.AUDIT_DIR / f"{today - timedelta(days=2)}.jsonl"
+        expired = butler.AUDIT_DIR / f"{today - timedelta(days=3)}.jsonl"
+        unrelated = butler.AUDIT_DIR / "unrelated.jsonl"
+        alias_log = butler.AUDIT_DIR / "2000-01-01.jsonl"
+        for path in (recent, expired, unrelated):
+            path.write_text("{}\n")
+        alias_log.symlink_to(unrelated)
         cli("_sweep")
+        assert not expired.exists() and recent.exists() and unrelated.exists() and alias_log.is_symlink()
         assert json.loads(cli("status"))["last_sweep"]["entries"] == []
+        events = [json.loads(line) for line in (butler.AUDIT_DIR / f"{today}.jsonl").read_text().splitlines()]
+        assert [entry["event"] for entry in events] == ["sweep_started", "sweep_finished"] * 2
+        assert events[-2]["sweep_id"] == events[-1]["sweep_id"]
         cli("uninstall")
         cli("uninstall")
         assert live is None and not butler.PLIST.exists()

@@ -3,7 +3,7 @@
 
 import argparse
 from contextlib import ExitStack, contextmanager
-from datetime import datetime
+from datetime import date, datetime, timedelta, timezone
 import fcntl
 import importlib.util
 import json
@@ -32,11 +32,14 @@ ARTIFACTS = HOME / "Library/Developer/AgentArtifacts"
 ROOT = ARTIFACTS / "disposable-scratch/ai-butler"
 CONFIG = HOME / ".config/ai-butler/config.json"
 REPORT = ARTIFACTS / "admin/ai-butler/latest.json"
+AUDIT_DIR = REPORT.parent / "audit"
 LABEL = "com.local.ai-butler"
 PLIST = HOME / "Library/LaunchAgents" / (LABEL + ".plist")
 SCRIPT = Path(__file__).resolve()
+SERVICE_COMMAND = ["/usr/bin/python3", str(SCRIPT)]
 DEFAULT_INTERVAL = 60
 DEFAULT_GRACE = 5
+DEFAULT_RETENTION = 7
 MAX_MINUTES = (2**31 - 1) // 60
 DB = HOME / ".t3/userdata/statev2.sqlite"
 WORKTREES = HOME / "workspace/worktrees"
@@ -52,15 +55,17 @@ def settings(missing_ok=True):
         if not missing_ok:
             raise
         return {"pools": ["tmp"], "settlement_grace_seconds": DEFAULT_GRACE * 60,
-                "interval_minutes": DEFAULT_INTERVAL}
+                "interval_minutes": DEFAULT_INTERVAL, "log_retention_days": DEFAULT_RETENTION}
     pools = cfg["pools"]
     grace = cfg["settlement_grace_seconds"]
     interval = cfg["interval_minutes"]
+    retention = cfg.setdefault("log_retention_days", DEFAULT_RETENTION)
     if (not isinstance(pools, list)
             or any(not isinstance(p, str) or not POOL_NAME.fullmatch(p) for p in pools)
             or len(set(pools)) != len(pools) or type(grace) is not int
             or not 60 <= grace <= MAX_MINUTES * 60 or grace % 60
-            or type(interval) is not int or not 1 <= interval <= MAX_MINUTES):
+            or type(interval) is not int or not 1 <= interval <= MAX_MINUTES
+            or type(retention) is not int or not 1 <= retention <= 36500):
         raise ValueError("Invalid pool or timing settings in " + str(CONFIG))
     return cfg
 
@@ -106,6 +111,37 @@ def read_local_json(path):
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
             raise ValueError(f"Not an owned metadata file: {path}")
         return json.load(stream)
+
+
+def audit(event, sweep_id, **fields):
+    now = datetime.now(timezone.utc)
+    path = ensure_directory(AUDIT_DIR) / f"{now.date().isoformat()}.jsonl"
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+    fd = os.open(path, flags, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8") as stream:
+        info = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_nlink != 1 or info.st_mode & 0o077):
+            raise ValueError("The audit log must be a private, owned regular file")
+        stream.write(json.dumps({"at": now.isoformat(),
+                                 "event": event, "sweep_id": sweep_id, **fields}) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def expire_audit(days):
+    cutoff = datetime.now(timezone.utc).date() - timedelta(days=days - 1)
+    for path in directory(AUDIT_DIR).iterdir():
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}\.jsonl", path.name):
+            continue
+        try:
+            day = date.fromisoformat(path.stem)
+        except ValueError:
+            continue
+        info = path.lstat()
+        if (day < cutoff and stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid()
+                and info.st_nlink == 1 and not info.st_mode & 0o077):
+            path.unlink()
 
 
 @contextmanager
@@ -207,7 +243,7 @@ def open_or_mounted(data):
     return None
 
 
-def sweep(cfg, apply):
+def sweep(cfg, apply, sweep_id=None):
     if not shutil.rmtree.avoids_symlink_attacks:
         raise RuntimeError("This Python does not support symlink-safe directory removal")
     result = {"generated_at": datetime.now().astimezone().isoformat(),
@@ -241,8 +277,21 @@ def sweep(cfg, apply):
                             if reason:
                                 entry["reason"] = reason
                                 continue
-                            shutil.rmtree(job)
-                            entry["status"] = "deleted"
+                            if not sweep_id:
+                                raise ValueError("Deletion requires a sweep audit ID")
+                            evidence = {"path": str(job), "thread": owner["thread"],
+                                        "checkout": owner["checkout"],
+                                        "allocated_kib": entry["allocated_kib"],
+                                        "reason": "finished command, settled T3 threads, grace elapsed, no detected open files"}
+                            audit("delete_intent", sweep_id, **evidence)
+                            try:
+                                shutil.rmtree(job)
+                            except OSError as error:
+                                entry.update(status="delete_failed", reason=str(error))
+                                audit("delete_failed", sweep_id, **dict(evidence, reason=str(error)))
+                            else:
+                                entry["status"] = "deleted"
+                                audit("deleted", sweep_id, **evidence)
                         else:
                             entry["status"] = "eligible"
             except BlockingIOError:
@@ -340,7 +389,7 @@ def loaded():
 
 def definition(minutes):
     return {"Label": LABEL,
-            "ProgramArguments": ["/usr/bin/python3", str(SCRIPT), "_sweep"],
+            "ProgramArguments": [*SERVICE_COMMAND, "_sweep"],
             "StartInterval": minutes * 60, "RunAtLoad": True}
 
 
@@ -394,11 +443,13 @@ def config_details(cfg):
             "pools": [str(ROOT / name) for name in cfg["pools"]],
             "interval_minutes": cfg["interval_minutes"],
             "settlement_grace_minutes": cfg["settlement_grace_seconds"] // 60,
-            "launch_agent": str(PLIST), "latest_sweep_file": str(REPORT)}
+            "launch_agent": str(PLIST), "latest_sweep_file": str(REPORT),
+            "audit_directory": str(AUDIT_DIR), "log_retention_days": cfg["log_retention_days"]}
 
 
 def status():
-    result = {"loaded": loaded(), "launch_agent": str(PLIST), "latest_sweep_file": str(REPORT)}
+    result = {"loaded": loaded(), "launch_agent": str(PLIST), "latest_sweep_file": str(REPORT),
+              "audit_directory": str(AUDIT_DIR)}
     try:
         report = read_local_json(REPORT)
     except FileNotFoundError:
@@ -408,16 +459,22 @@ def status():
 
 
 def scheduled_sweep():
+    sweep_id = uuid.uuid4().hex
     failed = False
     try:
-        result = sweep(settings(missing_ok=False), apply=True)
+        audit("sweep_started", sweep_id)
+        cfg = settings(missing_ok=False)
+        expire_audit(cfg["log_retention_days"])
+        result = sweep(cfg, apply=True, sweep_id=sweep_id)
     except (OSError, ValueError, KeyError, TypeError, RuntimeError,
             review.sqlite3.Error, subprocess.SubprocessError) as error:
         result = {"mode": "automatic", "generated_at": datetime.now().astimezone().isoformat(),
                   "error": str(error), "entries": []}
         failed = True
     ensure_directory(REPORT.parent)
+    result["sweep_id"] = sweep_id
     write_json(REPORT, result)
+    audit("sweep_finished", sweep_id, report=result)
     return int(failed)
 
 
@@ -433,6 +490,7 @@ def main():
     commands.add_parser("uninstall", help="Unload and remove the LaunchAgent")
     commands.add_parser("setInterval", help="Set sweep interval in minutes (0 resets to 60)").add_argument("minutes", type=int)
     commands.add_parser("setSettlementGracePeriod", help="Set settlement grace in minutes").add_argument("minutes", type=int)
+    commands.add_parser("setLogRetention", help="Set audit retention in days (default 7)").add_argument("days", type=int)
     commands.add_parser("preview", help="Show current eligibility; remove nothing")
     commands.add_parser("status", help="Show LaunchAgent and last sweep status")
     foreground = commands.add_parser("run", help="Run one foreground command with disposable temp")
@@ -457,6 +515,7 @@ def main():
             if action == "list" and not options.json:
                 print(f"Config: {CONFIG}\nSweep: {cfg['interval_minutes']} min; "
                       f"settlement grace: {cfg['settlement_grace_seconds'] // 60} min")
+                print(f"Audit logs: {AUDIT_DIR} ({cfg['log_retention_days']} days)")
                 print("\n".join(result["pools"]) or "(no pools configured)")
             else:
                 print(json.dumps(result, indent=2))
@@ -473,6 +532,11 @@ def main():
                 configure_service(cfg["interval_minutes"])
             elif action in ("add", "remove"):
                 configure_pool(cfg, options.path, action == "add")
+            elif action == "setLogRetention":
+                if not 1 <= options.days <= 36500:
+                    raise ValueError("Days must be between 1 and 36500")
+                cfg["log_retention_days"] = options.days
+                write_json(CONFIG, cfg)
             else:
                 minutes = options.minutes
                 if action == "setInterval" and minutes == 0:
