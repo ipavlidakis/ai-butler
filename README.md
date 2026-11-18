@@ -71,6 +71,39 @@ main checkouts, run results, and retained deliverables alone. Set a private
 storage location with `install --hooks --artifact-root <path>`, or use the
 default under macOS Application Support. Use `preview` to inspect eligibility.
 
+## Project stray files
+
+Some tools write output outside any path you can assign. For example, Skip
+writes `/private/tmp/skip-export-<time>.txt` for every `skip export`. You can
+list these patterns per project; the project is its folder name under
+`~/workspace/worktrees`:
+
+~~~sh
+ai-butler addProjectCleanup vesputio-fullstack '/private/tmp/skip-export-*.txt'
+ai-butler preview
+ai-butler removeProjectCleanup vesputio-fullstack '/private/tmp/skip-export-*.txt'
+~~~
+
+A pattern is an existing canonical directory (use `/private/tmp`, not `/tmp`)
+plus a filename glob with at least four literal characters. The directory can't
+overlap worktrees, T3 scratch, or AI Butler's own storage.
+
+These files have no ownership record, so AI Butler reads the first 64 KiB of
+each match. It looks for the one worktree of that project the file names. A
+match is removed only when all of these are true:
+
+- It is a regular file you own, with a single link.
+- It names exactly one worktree of the project.
+- Every T3 thread for that worktree, and its descendants, is settled past the
+  grace period.
+- The file hasn't changed within the grace period, and `lsof` reports it isn't
+  open.
+
+If the named worktree and all its threads are already gone, the file counts as
+orphaned and is removed. Files that name no worktree or several worktrees are
+kept, and so is a worktree that still exists without a T3 thread. Deletions use
+the same intent and outcome audit records as the other cleanup.
+
 ## Install
 
 Requires macOS, a logged-in user session, Python 3.9 or later, and a local T3
@@ -103,6 +136,8 @@ while its LaunchAgent is installed.
 | `uninstall` | Unload and remove the LaunchAgent. Keep the configuration and disk data. |
 | `setInterval <minutes>` | Change the sweep interval. `0` restores the default of 60 minutes. Reload the installed service to apply it. |
 | `setSettlementGracePeriod <minutes>` | Change the minimum time after both the foreground command finishes and T3 settles its thread. Keep the prototype's five-minute default. If work resumes, recalculate eligibility from the new settlement. |
+| `addProjectCleanup <project> <pattern>` | Clean a project's stray tool output after the worktree it names settles. See [Project stray files](#project-stray-files). |
+| `removeProjectCleanup <project> <pattern>` | Stop cleaning that pattern. Matching files stay on disk. |
 | `setLogRetention <days>` | Keep that many calendar days of audit logs, including today (UTC). Default: seven. Expired logs are removed on the next scheduled sweep. |
 | `run [--thread <id>] [--pool <name>] -- <command>` | From the T3 checkout, opt in one foreground command. Uses `T3CODE_THREAD_ID` by default. |
 | `preview` | List what a sweep would keep or remove, with reasons, without deleting data. |

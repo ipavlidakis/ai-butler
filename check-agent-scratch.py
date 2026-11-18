@@ -216,7 +216,75 @@ with tempfile.TemporaryDirectory(dir=args.fixture_parent) as temp:
     with redirect_stdout(StringIO()):
         scratch.artifact_hook(argparse.Namespace(provider="other", cwd=str(checkout), session="fixture"))
     assert (build / "swiftpm").is_dir() and (checkout / ".build").is_dir()
+
+    # Project cleanup: stray tool output outside the workspace, attributed by the worktree it names.
+    stray = base / "stray"
+    stray.mkdir()
+    for bad in ("/skip-*.txt", str(stray / "*.t"), str(scratch.WORKTREES / "demo/x-*.txt"),
+                str(stray) + "/../stray/skip-*.txt"):
+        try:
+            scratch.configure_project(cfg, "demo", bad, True)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"accepted unsafe pattern {bad}")
+    scratch.configure_project(cfg, "demo", str(stray / "skip-export-*.txt"), True)
+    assert scratch.read_local_json(scratch.CONFIG)["project_cleanup"] == {
+        "demo": [str(stray / "skip-export-*.txt")]}
+    old = time.time() - 120
+
+    def stray_file(name, text, mtime=old):
+        path = stray / name
+        path.write_text(text)
+        os.utime(path, (mtime, mtime))
+        return path
+    owned = stray_file("skip-export-owned.txt", f"--package-path {checkout}/Packages/A\n{checkout}/B\n")
+    anonymous = stray_file("skip-export-anon.txt", "no owner here\n")
+    ambiguous = stray_file("skip-export-two.txt", f"{checkout}\n{scratch.WORKTREES / 'demo/other'}\n")
+    orphan = stray_file("skip-export-orphan.txt", f"{scratch.WORKTREES / 'demo/removed'}/x\n")
+    unowned_checkout = scratch.WORKTREES / "demo/unowned"
+    unowned_checkout.mkdir()
+    unowned = stray_file("skip-export-unowned.txt", f"{unowned_checkout}/x\n")
+    unrelated = stray_file("unrelated.txt", f"{checkout}\n")
+
+    def strays(apply):
+        rows = scratch.sweep(cfg, apply, sweep_id="project-fixture")["entries"]
+        return {Path(r["path"]).name: r for r in rows if r.get("kind") == "project-file"}
+
+    def expect_stray(apply, name, status, reason=None):
+        row = strays(apply)[name]
+        assert row["status"] == status, row
+        if reason:
+            assert reason in row["reason"], row
+    rows = strays(False)
+    assert "unrelated.txt" not in rows
+    assert rows["skip-export-anon.txt"]["status"] == "keep"
+    assert "exactly one" in rows["skip-export-two.txt"]["reason"]
+    assert "without T3 ownership" in rows["skip-export-unowned.txt"]["reason"]
+    assert rows["skip-export-orphan.txt"]["status"] == "eligible"
+    assert rows["skip-export-owned.txt"]["status"] == "eligible", rows["skip-export-owned.txt"]
+    register_thread("indirect", None, None, "child")
+    expect_stray(True, "skip-export-owned.txt", "keep", "not settled")
+    register_thread("indirect", settled_at, None, "child")
+    os.utime(owned, None)
+    expect_stray(True, "skip-export-owned.txt", "keep", "grace")
+    os.utime(owned, (old, old))
+    with owned.open():
+        expect_stray(True, "skip-export-owned.txt", "keep", "open file")
+    with patch.object(scratch, "audit", side_effect=OSError("test audit write failed")):
+        expect_stray(True, "skip-export-owned.txt", "keep", "test audit write failed")
+    rows = strays(True)
+    assert rows["skip-export-owned.txt"]["status"] == "deleted"
+    assert not owned.exists() and not orphan.exists()  # The orphan went on the first applied sweep.
+    assert anonymous.exists() and ambiguous.exists() and unowned.exists() and unrelated.exists()
+    events = [json.loads(line) for path in scratch.AUDIT_DIR.glob("*.jsonl")
+              for line in path.read_text().splitlines()]
+    for path in (owned, orphan):
+        assert [e["event"] for e in events if e.get("path") == str(path)] == ["delete_intent", "deleted"]
+    scratch.configure_project(cfg, "demo", str(stray / "skip-export-*.txt"), False)
+    assert "project_cleanup" not in scratch.read_local_json(scratch.CONFIG)
     conn.close()
     os.chdir(base.parent)
 print("PASS: opted-in allocation, settlement, shared checkout, queued run, lock, open file, T3 unavailable, preview, and scoped removal")
 print("PASS: hook-allocated build cache, shared owners, evidence, aliases, audit and resumed threads")
+print("PASS: project stray files: unsafe patterns, owner attribution, orphans, settlement, grace, open file, audit")

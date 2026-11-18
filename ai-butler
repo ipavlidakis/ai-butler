@@ -7,6 +7,7 @@ import ctypes
 from datetime import date, datetime, timedelta, timezone
 import errno
 import fcntl
+import fnmatch
 import hashlib
 import importlib.util
 import json
@@ -50,6 +51,8 @@ WORKTREES = HOME / "workspace/worktrees"
 T3_SCRATCH = HOME / ".t3/scratch"
 POOL_NAME = re.compile(r"[a-z][a-z0-9-]{0,31}")
 JOB_NAME = re.compile(r"[0-9a-f]{32}")
+PROJECT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+OWNER_SCAN_BYTES = 64 * 1024
 
 
 def settings(missing_ok=True):
@@ -64,13 +67,18 @@ def settings(missing_ok=True):
     grace = cfg["settlement_grace_seconds"]
     interval = cfg["interval_minutes"]
     retention = cfg.setdefault("log_retention_days", DEFAULT_RETENTION)
+    projects = cfg.get("project_cleanup", {})
     if (not isinstance(pools, list)
             or any(not isinstance(p, str) or not POOL_NAME.fullmatch(p) for p in pools)
             or len(set(pools)) != len(pools) or type(grace) is not int
             or not 60 <= grace <= MAX_MINUTES * 60 or grace % 60
             or type(interval) is not int or not 1 <= interval <= MAX_MINUTES
-            or type(retention) is not int or not 1 <= retention <= 36500):
-        raise ValueError("Invalid pool or timing settings in " + str(CONFIG))
+            or type(retention) is not int or not 1 <= retention <= 36500
+            or not isinstance(projects, dict)
+            or any(not isinstance(k, str) or not PROJECT_NAME.fullmatch(k)
+                   or not isinstance(v, list) or any(not isinstance(p, str) for p in v)
+                   for k, v in projects.items())):
+        raise ValueError("Invalid pool, project or timing settings in " + str(CONFIG))
     return cfg
 
 
@@ -531,6 +539,133 @@ def inspect_build(cfg, apply, sweep_id, workspace, build, entry):
         audit("deleted", sweep_id, **evidence)
 
 
+def project_pattern(cfg, value):
+    """Split a stray-file pattern into a literal, canonical directory and a filename glob."""
+    path = Path(value)
+    parent, name = path.parent, path.name
+    if (not path.is_absolute() or str(path) != value or not review.directory(parent)
+            or any(c in str(parent) for c in "*?[]") or len(re.sub(r"[*?\[\]]", "", name)) < 4):
+        raise ValueError(f"Pattern must be an existing canonical directory plus a filename glob "
+                         f"with at least four literal characters: {value}")
+    managed = build_workspaces(cfg)
+    for protected in (WORKTREES, T3_SCRATCH, ROOT, REPORT.parent, *([managed] if managed else [])):
+        if review.overlaps(parent, protected):
+            raise ValueError(f"Pattern directory overlaps managed or T3 storage: {parent}")
+    return parent, name
+
+
+def file_owner(path, project):
+    """Return the one worktree of `project` that the file names, plus the file's identity."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+            raise ValueError("Not an owned regular file with a single link")
+        head = stream.read(OWNER_SCAN_BYTES).decode("utf-8", "replace")
+    names = set(re.findall(re.escape(str(WORKTREES / project)) + r"/([^/\s\"'`:;,)]+)", head))
+    checkout = WORKTREES / project / names.pop() if len(names) == 1 else None
+    return checkout, [info.st_dev, info.st_ino]
+
+
+def check_project_file(path, expected, checkout, grace):
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or [info.st_dev, info.st_ino] != expected:
+        return "file was replaced"
+    if info.st_mtime > time.time() - grace:
+        return "file changed within the grace period"
+    snapshot = review.load_t3(DB)
+    if snapshot.has_unmapped_legacy_threads:
+        return "no complete T3 ownership"
+    if any(review.overlaps(path.parent, p) for p in (*snapshot.projects, *snapshot.threads)):
+        return "file directory overlaps a T3 checkout"
+    if not snapshot.threads.get(checkout) and (checkout.exists() or checkout.is_symlink()):
+        return "named worktree exists without T3 ownership"
+    # A removed worktree with no remaining threads has no owner left to protect.
+    return settled_threads(snapshot, checkout, grace)
+
+
+def file_open(path):
+    opened = subprocess.run(["/usr/sbin/lsof", "-nP", "--", str(path)], capture_output=True, timeout=30)
+    if opened.returncode != 1 or opened.stdout or opened.stderr:
+        return "open file or incomplete process check"
+    return None
+
+
+def sweep_project_files(cfg, apply, sweep_id, entries):
+    grace = cfg["settlement_grace_seconds"]
+    for project, patterns in sorted(cfg.get("project_cleanup", {}).items()):
+        for value in patterns:
+            try:
+                parent, name = project_pattern(cfg, value)
+                matches = sorted(p for p in parent.iterdir() if fnmatch.fnmatchcase(p.name, name))
+            except (OSError, ValueError) as exc:
+                entries.append({"kind": "project-file", "project": project, "path": value,
+                                "status": "keep", "reason": str(exc)})
+                continue
+            for path in matches:
+                entry = {"kind": "project-file", "project": project, "path": str(path), "status": "keep"}
+                entries.append(entry)
+                try:
+                    inspect_project_file(apply, sweep_id, project, path, grace, entry)
+                except (OSError, ValueError, KeyError, TypeError, RuntimeError,
+                        review.sqlite3.Error, subprocess.SubprocessError) as exc:
+                    entry["reason"] = str(exc)
+
+
+def inspect_project_file(apply, sweep_id, project, path, grace, entry):
+    checkout, expected = file_owner(path, project)
+    if checkout is None:
+        entry["reason"] = "file does not name exactly one worktree of this project"
+        return
+    entry["checkout"] = str(checkout)
+    reason = check_project_file(path, expected, checkout, grace) or file_open(path)
+    if reason:
+        entry["reason"] = reason
+        return
+    entry["allocated_kib"] = -(-path.lstat().st_blocks * 512 // 1024)
+    if not apply:
+        entry["status"] = "eligible"
+        return
+    if not sweep_id:
+        raise ValueError("Deletion requires a sweep audit ID")
+    evidence = {"kind": "project-file", "project": project, "path": str(path),
+                "checkout": entry["checkout"], "allocated_kib": entry["allocated_kib"],
+                "reason": "named worktree's T3 threads settled, grace elapsed, file not open"}
+    audit("delete_intent", sweep_id, **evidence)
+    reason = check_project_file(path, expected, checkout, grace) or file_open(path)
+    if reason:
+        entry["reason"] = reason
+        audit("delete_cancelled", sweep_id, **dict(evidence, reason=reason))
+        return
+    # shortcut: no lock covers foreign tool output; the identity check above bounds the race.
+    try:
+        path.unlink()
+    except OSError as exc:
+        entry.update(status="delete_failed", reason=str(exc))
+        audit("delete_failed", sweep_id, **dict(evidence, reason=str(exc)))
+        return
+    entry["status"] = "deleted"
+    audit("deleted", sweep_id, **evidence)
+
+
+def configure_project(cfg, project, value, add):
+    if not PROJECT_NAME.fullmatch(project):
+        raise ValueError("Project must be its folder name under " + str(WORKTREES))
+    projects = cfg.setdefault("project_cleanup", {})
+    patterns = projects.setdefault(project, [])
+    if add:
+        project_pattern(cfg, value)
+        if value not in patterns:
+            patterns.append(value)
+    elif value in patterns:
+        patterns.remove(value)
+    if not patterns:
+        projects.pop(project)
+    if not projects:
+        cfg.pop("project_cleanup")
+    write_json(CONFIG, cfg)
+
+
 def sweep(cfg, apply, sweep_id=None):
     if not shutil.rmtree.avoids_symlink_attacks:
         raise RuntimeError("This Python does not support symlink-safe directory removal")
@@ -593,6 +728,7 @@ def sweep(cfg, apply, sweep_id=None):
                     review.sqlite3.Error, subprocess.SubprocessError) as exc:
                 entry["reason"] = str(exc)
     sweep_builds(cfg, apply, sweep_id, result["entries"])
+    sweep_project_files(cfg, apply, sweep_id, result["entries"])
     return result
 
 
@@ -741,7 +877,8 @@ def config_details(cfg):
             "settlement_grace_minutes": cfg["settlement_grace_seconds"] // 60,
             "launch_agent": str(PLIST), "latest_sweep_file": str(REPORT),
             "audit_directory": str(AUDIT_DIR), "log_retention_days": cfg["log_retention_days"],
-            "build_artifacts_root": cfg.get("build_artifacts_root")}
+            "build_artifacts_root": cfg.get("build_artifacts_root"),
+            "project_cleanup": cfg.get("project_cleanup", {})}
 
 
 def status():
@@ -792,6 +929,11 @@ def main():
     commands.add_parser("setInterval", help="Set sweep interval in minutes (0 resets to 60)").add_argument("minutes", type=int)
     commands.add_parser("setSettlementGracePeriod", help="Set settlement grace in minutes").add_argument("minutes", type=int)
     commands.add_parser("setLogRetention", help="Set audit retention in days (default 7)").add_argument("days", type=int)
+    for name, text in (("addProjectCleanup", "Clean a project's stray files after its worktree settles"),
+                       ("removeProjectCleanup", "Stop cleaning a project's stray-file pattern")):
+        project = commands.add_parser(name, help=text)
+        project.add_argument("project", help="Folder name under ~/workspace/worktrees")
+        project.add_argument("pattern", help="Canonical directory plus filename glob")
     commands.add_parser("preview", help="Show current eligibility; remove nothing")
     commands.add_parser("status", help="Show LaunchAgent and last sweep status")
     hook = commands.add_parser("artifact-hook", help="Allocate workspace and run output paths")
@@ -827,6 +969,8 @@ def main():
                 print(f"Audit logs: {AUDIT_DIR} ({cfg['log_retention_days']} days)")
                 if cfg.get("build_artifacts_root"):
                     print(f"Build artifacts: {cfg['build_artifacts_root']}")
+                for project, patterns in sorted(result["project_cleanup"].items()):
+                    print(f"Project {project}: " + ", ".join(patterns))
                 print("\n".join(result["pools"]) or "(no pools configured)")
             else:
                 print(json.dumps(result, indent=2))
@@ -861,6 +1005,8 @@ def main():
                     configure_service(cfg["interval_minutes"])
             elif action in ("add", "remove"):
                 configure_pool(cfg, options.path, action == "add")
+            elif action in ("addProjectCleanup", "removeProjectCleanup"):
+                configure_project(cfg, options.project, options.pattern, action == "addProjectCleanup")
             elif action == "setLogRetention":
                 if not 1 <= options.days <= 36500:
                     raise ValueError("Days must be between 1 and 36500")
