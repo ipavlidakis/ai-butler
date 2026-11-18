@@ -302,8 +302,63 @@ with tempfile.TemporaryDirectory(dir=args.fixture_parent) as temp:
         assert [e["event"] for e in events if e.get("path") == str(path)] == ["delete_intent", "deleted"]
     scratch.configure_project(cfg, "demo", str(stray / "skip-export-*.txt"), False)
     assert "project_cleanup" not in scratch.read_local_json(scratch.CONFIG)
+
+    # Evidence retention: a run folder goes once it is old enough, its owners settled, and nothing is open.
+    run_dir = Path(env["AGENT_RUN_DIR"])
+    (run_dir / "logs" / "evidence.log").write_text("proof\n")
+
+    def age(path, days):
+        moment = time.time() - days * 86400
+        for item in sorted(path.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+            os.utime(item, (moment, moment), follow_symlinks=False)
+        os.utime(path, (moment, moment))
+
+    def evidence(apply, status, reason=None):
+        rows = [r for r in scratch.sweep(cfg, apply, sweep_id="evidence-fixture")["entries"]
+                if r.get("kind") == "evidence"]
+        row, = rows
+        assert row["path"] == str(run_dir) and row["status"] == status, row
+        if reason:
+            assert reason in row["reason"], row
+    assert cfg["evidence_retention_days"] == 7
+    evidence(True, "keep", "changed within the last 7 days")
+    age(run_dir, 8)
+    register_thread("child", None)
+    evidence(True, "keep", "not settled")
+    register_thread("child", settled_at)
+    with (run_dir / "logs" / "evidence.log").open():
+        evidence(True, "keep", "open files")
+    cfg["evidence_retention_days"] = 0
+    assert not [r for r in scratch.sweep(cfg, True, sweep_id="x")["entries"] if r.get("kind") == "evidence"]
+    cfg["evidence_retention_days"] = 7
+    evidence(False, "eligible")
+    assert run_dir.exists()
+    evidence(True, "deleted")
+    assert not run_dir.exists() and (workspace / "owner.json").exists()
+    events = [json.loads(line) for path in scratch.AUDIT_DIR.glob("*.jsonl")
+              for line in path.read_text().splitlines()]
+    assert [e["event"] for e in events if e.get("path") == str(run_dir)] == ["delete_intent", "deleted"]
+
+    # Storage report: sizes are recorded per sweep and compared with a fresh measurement.
+    grown = base / "grown"
+    grown.mkdir()
+    (grown / "a.bin").write_bytes(b"\0" * 1024 * 1024)
+    cfg["report_paths"] = [str(grown), str(base / "missing")]
+    scratch.ensure_directory(scratch.REPORT.parent)
+    scratch.record_sizes(cfg)
+    (grown / "b.bin").write_bytes(b"\0" * 4 * 1024 * 1024)
+    result = scratch.storage_report(cfg, None)
+    rows = {row["path"]: row for row in result["paths"]}
+    assert result["baseline_at"] and rows[str(grown)]["change_kib"] >= 4000, rows
+    assert rows[str(base / "missing")]["now_kib"] is None
+    assert cfg["build_artifacts_root"] in rows
+    assert scratch.storage_report(cfg, scratch.parse_since("2026-01-01T00:00:00+00:00"))["baseline_at"]
+    future = datetime.now(timezone.utc).replace(year=2999)
+    assert scratch.storage_report(cfg, future)["baseline_at"] is None
+    assert scratch.parse_since("2h") < datetime.now(timezone.utc)
     conn.close()
     os.chdir(base.parent)
 print("PASS: opted-in allocation, settlement, shared checkout, queued run, detached and bound sessions, lock, open file, T3 unavailable, preview, and scoped removal")
 print("PASS: hook-allocated build cache, shared owners, evidence, aliases, audit and resumed threads")
 print("PASS: project stray files: unsafe patterns, owner attribution, orphans, settlement, grace, open file, audit")
+print("PASS: evidence retention: age, settlement, open file, disabled, preview, audit; storage report history")
