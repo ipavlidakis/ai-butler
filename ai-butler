@@ -1,0 +1,507 @@
+#!/usr/bin/python3
+"""Allocate and retire one-command scratch directories on the T3 worker."""
+
+import argparse
+from contextlib import ExitStack, contextmanager
+from datetime import datetime
+import fcntl
+import importlib.util
+import json
+import os
+from pathlib import Path
+import plistlib
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+
+
+sys.dont_write_bytecode = True
+spec = importlib.util.spec_from_file_location(
+    "artifact_review", Path(__file__).resolve().with_name("agent-artifact-review.py")
+)
+review = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(review)
+
+HOME = Path.home()
+ARTIFACTS = HOME / "Library/Developer/AgentArtifacts"
+ROOT = ARTIFACTS / "disposable-scratch/ai-butler"
+CONFIG = HOME / ".config/ai-butler/config.json"
+REPORT = ARTIFACTS / "admin/ai-butler/latest.json"
+LABEL = "com.local.ai-butler"
+PLIST = HOME / "Library/LaunchAgents" / (LABEL + ".plist")
+SCRIPT = Path(__file__).resolve()
+DEFAULT_INTERVAL = 60
+DEFAULT_GRACE = 5
+MAX_MINUTES = (2**31 - 1) // 60
+DB = HOME / ".t3/userdata/statev2.sqlite"
+WORKTREES = HOME / "workspace/worktrees"
+T3_SCRATCH = HOME / ".t3/scratch"
+POOL_NAME = re.compile(r"[a-z][a-z0-9-]{0,31}")
+JOB_NAME = re.compile(r"[0-9a-f]{32}")
+
+
+def settings(missing_ok=True):
+    try:
+        cfg = read_local_json(CONFIG)
+    except FileNotFoundError:
+        if not missing_ok:
+            raise
+        return {"pools": ["tmp"], "settlement_grace_seconds": DEFAULT_GRACE * 60,
+                "interval_minutes": DEFAULT_INTERVAL}
+    pools = cfg["pools"]
+    grace = cfg["settlement_grace_seconds"]
+    interval = cfg["interval_minutes"]
+    if (not isinstance(pools, list)
+            or any(not isinstance(p, str) or not POOL_NAME.fullmatch(p) for p in pools)
+            or len(set(pools)) != len(pools) or type(grace) is not int
+            or not 60 <= grace <= MAX_MINUTES * 60 or grace % 60
+            or type(interval) is not int or not 1 <= interval <= MAX_MINUTES):
+        raise ValueError("Invalid pool or timing settings in " + str(CONFIG))
+    return cfg
+
+
+def directory(path):
+    if not review.directory(path) or path.is_symlink() or path.stat().st_uid != os.getuid():
+        raise ValueError(f"Not an owned, canonical directory: {path}")
+    return path
+
+
+def identity(path):
+    info = directory(path).stat()
+    return [info.st_dev, info.st_ino]
+
+
+def write_file(path, data):
+    with tempfile.NamedTemporaryFile(dir=directory(path.parent), delete=False) as stream:
+        try:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+            stream.close()
+            os.replace(stream.name, path)
+        finally:
+            Path(stream.name).unlink(missing_ok=True)
+
+
+def write_json(path, data):
+    write_file(path, (json.dumps(data, indent=2) + "\n").encode())
+
+
+def ensure_directory(path):
+    if not path.exists():
+        ensure_directory(path.parent)
+        path.mkdir(mode=0o700, exist_ok=True)
+    return directory(path)
+
+
+def read_local_json(path):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd) as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            raise ValueError(f"Not an owned metadata file: {path}")
+        return json.load(stream)
+
+
+@contextmanager
+def lock_file(path, create=0, nonblocking=True, shared=False):
+    flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK
+    directory(path.parent)
+    fd = os.open(path, flags | create, 0o600)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+            raise ValueError("Invalid lock file")
+        fcntl.flock(fd, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+                    | (fcntl.LOCK_NB if nonblocking else 0))
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def lock(job, create=False):
+    return lock_file(job / "lock", os.O_CREAT | os.O_EXCL if create else 0)
+
+
+@contextmanager
+def config_lock(shared=False):
+    ensure_directory(CONFIG.parent)
+    with lock_file(CONFIG.with_name("lock"), os.O_CREAT, nonblocking=False, shared=shared):
+        yield
+
+
+def thread_checkout(snapshot, thread, allow_missing=False):
+    matches = [path for path, rows in snapshot.threads.items()
+               if any(tid == thread for tid, _ in rows)]
+    if (snapshot.has_unmapped_legacy_threads or len(matches) != 1
+            or not any(root in matches[0].parents for root in (WORKTREES, T3_SCRATCH))):
+        raise ValueError("Thread must map to an exact managed T3 worktree or scratch checkout")
+    checkout = matches[0]
+    if not allow_missing or checkout.exists():
+        directory(checkout)
+    if any(review.overlaps(checkout, p) and p != T3_SCRATCH for p in snapshot.projects):
+        raise ValueError("Thread overlaps a T3 project checkout")
+    if any(review.overlaps(ROOT, path) for path in (*snapshot.projects, *snapshot.threads)):
+        raise ValueError("A T3 checkout overlaps the disposable storage root")
+    return checkout
+
+
+def ready(job, owner, grace):
+    if owner["job"] != job.name or owner["job_identity"] != identity(job):
+        return "registration does not match this directory"
+    data = directory(job / "data")
+    if owner["data_identity"] != identity(data):
+        return "scratch directory has been replaced"
+    if len({path.stat().st_dev for path in (ROOT, job.parent, job, data)}) != 1:
+        return "scratch is on another filesystem"
+    if owner["finished_at"] is None or not owner["finished_at"] <= time.time() - grace:
+        return "command has not finished or is still within the grace period"
+    snapshot = review.load_t3(DB)
+    checkout = thread_checkout(snapshot, owner["thread"], allow_missing=True)
+    if (str(checkout) != owner["checkout"]
+            or checkout.exists() and identity(checkout) != owner["checkout_identity"]):
+        return "T3 checkout no longer matches the registration"
+    related = {owner["thread"]}
+    for path, rows in snapshot.threads.items():
+        if review.overlaps(path, checkout):
+            related.update(tid for tid, _ in rows)
+    descendants = {}
+    for tid, row in snapshot.thread_rows.items():
+        parent = (row.get("lineage") or {}).get("parentThreadId")
+        if parent is not None:
+            descendants.setdefault(parent, []).append(tid)
+    pending = list(related)
+    while pending:
+        for child in descendants.get(pending.pop(), ()):
+            if child not in related:
+                related.add(child)
+                pending.append(child)
+    for tid in related:
+        row = snapshot.thread_rows[tid]
+        settled = row["settledAt"]
+        if (not settled or row.get("settledOverride") == "active" or row.get("pinnedAt")
+                or row.get("snoozedUntil") or tid in snapshot.active):
+            return "T3 owner or related thread is active or not settled"
+        timestamp = datetime.fromisoformat(settled.replace("Z", "+00:00"))
+        if timestamp.tzinfo is None or time.time() - timestamp.timestamp() < grace:
+            return "T3 thread settled within the grace period"
+    return None
+
+
+def open_or_mounted(data):
+    def fail(exc):
+        raise exc
+    device = data.stat().st_dev
+    for base, dirs, files in os.walk(data, followlinks=False, onerror=fail):
+        for name in dirs + files:
+            if (Path(base) / name).lstat().st_dev != device:
+                return "scratch contains another filesystem"
+    opened = subprocess.run(["/usr/sbin/lsof", "-nP", "+D", str(data)], capture_output=True, timeout=30)
+    if opened.returncode != 1 or opened.stdout or opened.stderr:
+        return "open files or incomplete process check"
+    return None
+
+
+def sweep(cfg, apply):
+    if not shutil.rmtree.avoids_symlink_attacks:
+        raise RuntimeError("This Python does not support symlink-safe directory removal")
+    result = {"generated_at": datetime.now().astimezone().isoformat(),
+              "mode": "automatic" if apply else "preview", "entries": []}
+    for name in cfg["pools"]:
+        pool = directory(directory(ROOT) / name) if (ROOT / name).exists() else None
+        if pool is None:
+            continue
+        for job in sorted(pool.iterdir()):
+            if not JOB_NAME.fullmatch(job.name):
+                continue
+            entry = {"path": str(job / "data"), "status": "keep"}
+            result["entries"].append(entry)
+            try:
+                with lock(job):
+                    if {item.name for item in job.iterdir()} != {"lock", "owner.json", "data"}:
+                        raise ValueError("Unrecognized contents outside the job's data directory")
+                    owner = read_local_json(job / "owner.json")
+                    entry["thread"] = owner["thread"]
+                    grace = cfg["settlement_grace_seconds"]
+                    reason = ready(job, owner, grace)
+                    if not reason:
+                        reason = open_or_mounted(job / "data") or ready(job, owner, grace)
+                    if reason:
+                        entry["reason"] = reason
+                    else:
+                        entry["allocated_kib"] = review.size_kib(job / "data")
+                        if apply:
+                            # New commands never reuse a job path. Hold its lock through deletion.
+                            reason = ready(job, owner, grace)
+                            if reason:
+                                entry["reason"] = reason
+                                continue
+                            shutil.rmtree(job)
+                            entry["status"] = "deleted"
+                        else:
+                            entry["status"] = "eligible"
+            except BlockingIOError:
+                entry["reason"] = "command still holds the scratch lock"
+            except (OSError, ValueError, KeyError, TypeError, RuntimeError,
+                    review.sqlite3.Error, subprocess.SubprocessError) as exc:
+                entry["reason"] = str(exc)
+    return result
+
+
+def allocate(cfg, options, command_scope):
+    thread = options.thread or os.environ.get("T3CODE_THREAD_ID")
+    if not thread:
+        raise ValueError("Run from T3 or pass --thread with the current T3 thread ID")
+    if os.environ.get("T3CODE_THREAD_ID", thread) != thread:
+        raise ValueError("--thread must match the current T3 thread")
+    checkout = thread_checkout(review.load_t3(DB), thread)
+    cwd = Path.cwd().resolve()
+    if cwd != checkout and checkout not in cwd.parents:
+        raise ValueError("Current directory is outside the T3 thread's checkout")
+    name = options.pool or next(iter(cfg["pools"]), None)
+    if name not in cfg["pools"]:
+        raise ValueError("Pool is not configured")
+    cmd = options.command
+    if cmd and cmd[0] == "--":
+        cmd = cmd[1:]
+    if not cmd:
+        raise ValueError("Pass a foreground command after --")
+    pool = ensure_directory(ROOT / name)
+    job = pool / uuid.uuid4().hex
+    job.mkdir(mode=0o700)
+    data = job / "data"
+    data.mkdir(mode=0o700)
+    fd = command_scope.enter_context(lock(job, create=True))
+    registration = {"job": job.name, "job_identity": identity(job),
+                    "data_identity": identity(data), "thread": thread, "checkout": str(checkout),
+                    "checkout_identity": identity(checkout), "finished_at": None}
+    write_json(job / "owner.json", registration)
+    return job, registration, cmd, fd
+
+
+def run(options):
+    with ExitStack() as command_scope:
+        with config_lock(shared=True):
+            job, registration, cmd, fd = allocate(settings(), options, command_scope)
+        data = job / "data"
+        print(f"Disposable scratch: {data}", file=sys.stderr)
+        env = dict(os.environ, AGENT_TMP_DIR=str(data), TMPDIR=str(data) + "/")
+        result = subprocess.run(cmd, env=env, pass_fds=(fd,))
+        registration["finished_at"] = time.time()
+        write_json(job / "owner.json", registration)
+        return result.returncode if result.returncode >= 0 else 128 - result.returncode
+
+
+def pool_name(value):
+    path = Path(value).expanduser()
+    if path.parent != ROOT or not POOL_NAME.fullmatch(path.name):
+        raise ValueError(f"Pool must be a direct child of {ROOT} with a lowercase name")
+    return path.name
+
+
+def configure_pool(cfg, value, add):
+    name = pool_name(value)
+    if add:
+        if name in cfg["pools"]:
+            return
+        path = ensure_directory(ROOT / name)
+        if any(path.iterdir()):
+            raise ValueError("An existing pool must be empty before it can be registered")
+        cfg["pools"].append(name)
+    elif name in cfg["pools"]:
+        cfg["pools"].remove(name)
+    write_json(CONFIG, cfg)
+
+
+def launchctl(*args, check=True):
+    return subprocess.run(["/bin/launchctl", *args], text=True, capture_output=True,
+                          timeout=30, check=check)
+
+
+def domain():
+    return f"gui/{os.getuid()}"
+
+
+def loaded():
+    result = launchctl("print", f"{domain()}/{LABEL}", check=False)
+    if result.returncode == 0:
+        return True
+    if "Could not find service" in result.stderr:
+        return False
+    if "Could not find domain" in result.stderr:
+        return False
+    raise RuntimeError(result.stderr.strip() or "Could not read LaunchAgent status")
+
+
+def definition(minutes):
+    return {"Label": LABEL,
+            "ProgramArguments": ["/usr/bin/python3", str(SCRIPT), "_sweep"],
+            "StartInterval": minutes * 60, "RunAtLoad": True}
+
+
+def installed_definition():
+    if not PLIST.exists() and not PLIST.is_symlink():
+        return None
+    if PLIST.is_symlink() or not PLIST.is_file() or PLIST.stat().st_uid != os.getuid():
+        raise ValueError("Refusing to touch an unowned or symlinked LaunchAgent")
+    try:
+        old = plistlib.loads(PLIST.read_bytes())
+        interval = old["StartInterval"]
+        if (type(interval) is not int or interval % 60 or not 60 <= interval <= MAX_MINUTES * 60
+                or old != definition(interval // 60)):
+            raise ValueError("definition does not match this checkout")
+    except (ValueError, KeyError, TypeError) as error:
+        raise ValueError(f"Refusing to replace or remove {PLIST}: {error}") from error
+    return old
+
+
+def configure_service(minutes=None):
+    old = installed_definition()
+    running = loaded()
+    if running and old is None:
+        raise RuntimeError("A service with this label is loaded without a matching plist")
+    new = definition(minutes) if minutes is not None else None
+    if new == old and running == (new is not None):
+        return
+    if running:
+        launchctl("bootout", f"{domain()}/{LABEL}")
+    try:
+        if new is None:
+            PLIST.unlink()
+        else:
+            ensure_directory(PLIST.parent)
+            if new != old:
+                write_file(PLIST, plistlib.dumps(new))
+            launchctl("bootstrap", domain(), str(PLIST))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        if old is None:
+            if PLIST.exists():
+                PLIST.unlink()
+        else:
+            write_file(PLIST, plistlib.dumps(old))
+            if running:
+                launchctl("bootstrap", domain(), str(PLIST))
+        raise
+
+
+def config_details(cfg):
+    return {"config": str(CONFIG), "deletion_boundary": str(ROOT),
+            "pools": [str(ROOT / name) for name in cfg["pools"]],
+            "interval_minutes": cfg["interval_minutes"],
+            "settlement_grace_minutes": cfg["settlement_grace_seconds"] // 60,
+            "launch_agent": str(PLIST), "latest_sweep_file": str(REPORT)}
+
+
+def status():
+    result = {"loaded": loaded(), "launch_agent": str(PLIST), "latest_sweep_file": str(REPORT)}
+    try:
+        report = read_local_json(REPORT)
+    except FileNotFoundError:
+        report = None
+    result["last_sweep"] = report
+    return result
+
+
+def scheduled_sweep():
+    failed = False
+    try:
+        result = sweep(settings(missing_ok=False), apply=True)
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError,
+            review.sqlite3.Error, subprocess.SubprocessError) as error:
+        result = {"mode": "automatic", "generated_at": datetime.now().astimezone().isoformat(),
+                  "error": str(error), "entries": []}
+        failed = True
+    ensure_directory(REPORT.parent)
+    write_json(REPORT, result)
+    return int(failed)
+
+
+def main():
+    os.umask(0o077)
+    parser = argparse.ArgumentParser(prog="ai-butler", description=__doc__)
+    commands = parser.add_subparsers(dest="action", required=True)
+    listing = commands.add_parser("list", help="List managed paths and configuration")
+    listing.add_argument("--json", action="store_true")
+    commands.add_parser("add", help="Register a new or empty pool").add_argument("path")
+    commands.add_parser("remove", help="Unregister a pool without deleting it").add_argument("path")
+    commands.add_parser("install", help="Install or load the user LaunchAgent")
+    commands.add_parser("uninstall", help="Unload and remove the LaunchAgent")
+    commands.add_parser("setInterval", help="Set sweep interval in minutes (0 resets to 60)").add_argument("minutes", type=int)
+    commands.add_parser("setSettlementGracePeriod", help="Set settlement grace in minutes").add_argument("minutes", type=int)
+    commands.add_parser("preview", help="Show current eligibility; remove nothing")
+    commands.add_parser("status", help="Show LaunchAgent and last sweep status")
+    foreground = commands.add_parser("run", help="Run one foreground command with disposable temp")
+    foreground.add_argument("--thread")
+    foreground.add_argument("--pool")
+    foreground.add_argument("command", nargs=argparse.REMAINDER)
+    try:
+        if sys.argv[1:] == ["_sweep"]:
+            with config_lock():
+                # shortcut: local T3 projections cannot lock turn startup; scratch is single-use.
+                return scheduled_sweep()
+        options = parser.parse_args()
+        action = options.action
+        if action == "run":
+            return run(options)
+        if action == "status":
+            print(json.dumps(status(), indent=2))
+            return 0
+        if action in ("list", "preview"):
+            cfg = settings()
+            result = config_details(cfg) if action == "list" else sweep(cfg, apply=False)
+            if action == "list" and not options.json:
+                print(f"Config: {CONFIG}\nSweep: {cfg['interval_minutes']} min; "
+                      f"settlement grace: {cfg['settlement_grace_seconds'] // 60} min")
+                print("\n".join(result["pools"]) or "(no pools configured)")
+            else:
+                print(json.dumps(result, indent=2))
+            return 0
+        with config_lock():
+            if action == "uninstall":
+                configure_service()
+                return 0
+            cfg = settings()
+            if action == "install":
+                ensure_directory(ROOT)
+                if not CONFIG.exists():
+                    write_json(CONFIG, cfg)
+                configure_service(cfg["interval_minutes"])
+            elif action in ("add", "remove"):
+                configure_pool(cfg, options.path, action == "add")
+            else:
+                minutes = options.minutes
+                if action == "setInterval" and minutes == 0:
+                    minutes = DEFAULT_INTERVAL
+                if not 1 <= minutes <= MAX_MINUTES:
+                    raise ValueError(f"Minutes must be between 1 and {MAX_MINUTES}")
+                if action == "setInterval":
+                    previous = cfg.copy()
+                    cfg["interval_minutes"] = minutes
+                    installed = installed_definition() is not None
+                    write_json(CONFIG, cfg)
+                    if installed:
+                        try:
+                            configure_service(minutes)
+                        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+                            write_json(CONFIG, previous)
+                            raise
+                else:
+                    cfg["settlement_grace_seconds"] = minutes * 60
+                    write_json(CONFIG, cfg)
+        return 0
+    except subprocess.CalledProcessError as exc:
+        print(f"ai-butler: {exc.stderr.strip() if exc.stderr else exc}", file=sys.stderr)
+        return 1
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError,
+            review.sqlite3.Error, subprocess.SubprocessError) as exc:
+        print(f"ai-butler: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
