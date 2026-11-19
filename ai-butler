@@ -271,9 +271,19 @@ def open_or_mounted(data, preserve_evidence=False):
                 return "build directory contains a test result, archive, or export"
             if (Path(base) / name).lstat().st_dev != device:
                 return "scratch contains another filesystem"
-    opened = subprocess.run(["/usr/sbin/lsof", "-nP", "+D", str(data)], capture_output=True, timeout=30)
-    if opened.returncode != 1 or opened.stdout or opened.stderr:
-        return "open files or incomplete process check"
+    return open_under(data, "open files or incomplete process check")
+
+
+def open_under(path, reason):
+    # One system-wide listing stays fast; `lsof +D` walks the tree and timed out on a 45 GB cache.
+    opened = subprocess.run(["/usr/sbin/lsof", "-nP", "-F", "n"], capture_output=True, timeout=60)
+    if opened.returncode != 0 or opened.stderr:
+        return reason
+    target = os.fsencode(os.path.realpath(path))
+    for line in opened.stdout.splitlines():
+        name = line[1:]
+        if line[:1] == b"n" and (name == target or name.startswith(target + b"/")):
+            return reason
     return None
 
 
@@ -585,10 +595,7 @@ def check_project_file(path, expected, checkout, grace):
 
 
 def file_open(path):
-    opened = subprocess.run(["/usr/sbin/lsof", "-nP", "--", str(path)], capture_output=True, timeout=30)
-    if opened.returncode != 1 or opened.stdout or opened.stderr:
-        return "open file or incomplete process check"
-    return None
+    return open_under(path, "open file or incomplete process check")
 
 
 def sweep_project_files(cfg, apply, sweep_id, entries):

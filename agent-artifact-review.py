@@ -127,8 +127,9 @@ def owner(path):
 
 
 def size_kib(path):
+    # Large build caches (tens of GB) need minutes to measure.
     result = subprocess.run(["/usr/bin/du", "-sk", str(path)], check=True,
-                            capture_output=True, text=True, timeout=30)
+                            capture_output=True, text=True, timeout=300)
     return int(result.stdout.split()[0])
 
 
