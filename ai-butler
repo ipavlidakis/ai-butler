@@ -50,7 +50,7 @@ DATA_VOLUME = Path("/System/Volumes/Data")
 # Large locations agents grow outside AI Butler's deletion scope. The report only measures them.
 DEFAULT_REPORT_PATHS = ("~/Library/Developer/Xcode/DerivedData", "~/Library/Developer/CoreSimulator",
                         "/System/Library/AssetsV2", "~/.simlock", "~/Library/Caches/org.swift.swiftpm",
-                        "~/.gradle", "~/.local/share/containers", "~/workspace/worktrees")
+                        "~/.gradle", "~/Library/Caches/org.gradle", "~/.local/share/containers", "~/workspace/worktrees")
 MAX_MINUTES = (2**31 - 1) // 60
 DB = HOME / ".t3/userdata/statev2.sqlite"
 WORKTREES = HOME / "workspace/worktrees"

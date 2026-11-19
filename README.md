@@ -102,6 +102,7 @@ locations:
 - `~/.simlock`
 - `~/Library/Caches/org.swift.swiftpm`
 - `~/.gradle`
+- `~/Library/Caches/org.gradle` (shared read-only Gradle dependency cache)
 - `~/.local/share/containers` (container VMs)
 - `~/workspace/worktrees`
 
