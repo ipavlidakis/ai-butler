@@ -59,6 +59,9 @@ POOL_NAME = re.compile(r"[a-z][a-z0-9-]{0,31}")
 JOB_NAME = re.compile(r"[0-9a-f]{32}")
 PROJECT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 OWNER_SCAN_BYTES = 64 * 1024
+XCODE_DEFAULT_DERIVED_DATA = HOME / "Library/Developer/Xcode/DerivedData"
+DERIVED_FOLDER = re.compile(r"(.+)-([a-z]{28})")
+RETIRED_DERIVED = ".ai-butler-retired-"
 
 
 def settings(missing_ok=True):
@@ -759,6 +762,178 @@ def sweep_evidence(cfg, apply, sweep_id, entries):
                 entry["reason"] = str(exc)
 
 
+def xcode_derived_data():
+    """Return the DerivedData directory Xcode is set to use, or None when it is per workspace."""
+    found = subprocess.run(["/usr/bin/defaults", "read", "com.apple.dt.Xcode", "IDECustomDerivedDataLocation"],
+                           capture_output=True, text=True, timeout=30)
+    value = found.stdout.strip() if found.returncode == 0 else ""
+    path = Path(value).expanduser() if value else XCODE_DEFAULT_DERIVED_DATA
+    # A relative location puts DerivedData inside each workspace, which leaves with the worktree.
+    return path if path.is_absolute() else None
+
+
+def xcode_path_hash(path):
+    """Xcode's folder suffix: the MD5 of the workspace path, each half written as 14 letters."""
+    digest = hashlib.md5(path.encode()).digest()
+    letters = ""
+    for half in (digest[:8], digest[8:]):
+        value, chars = int.from_bytes(half, "big"), []
+        for _ in range(14):
+            chars.append(chr(ord("a") + value % 26))
+            value //= 26
+        letters += "".join(reversed(chars))
+    return letters
+
+
+def worktree_of(path):
+    if WORKTREES not in path.parents:
+        return None
+    parts = path.relative_to(WORKTREES).parts
+    return WORKTREES / parts[0] / parts[1] if len(parts) >= 2 else None
+
+
+def candidate_workspaces(checkout, name, listings):
+    """Paths in a worktree that Xcode would name `name`: a project, a workspace or a package folder."""
+    if checkout not in listings:
+        listed = subprocess.run(["/usr/bin/git", "-C", str(checkout), "ls-files", "-z", "--cached",
+                                 "--others", "--exclude-standard"],
+                                capture_output=True, timeout=120, check=True)
+        listings[checkout] = [Path(os.fsdecode(f)) for f in listed.stdout.split(b"\0") if f]
+    found = set()
+    for relative in listings[checkout]:
+        parent = checkout / relative.parent
+        if ((relative.name == "Package.swift" and parent.name == name)
+                or (relative.name == "project.pbxproj" and parent.name == name + ".xcodeproj")
+                or (relative.name == "contents.xcworkspacedata" and parent.name == name + ".xcworkspace")):
+            found.add(parent)
+    return found
+
+
+def derived_data_owner(folder, snapshot, listings):
+    """Return the T3 worktree an Xcode DerivedData folder was built from, or (None, reason)."""
+    name, suffix = DERIVED_FOLDER.fullmatch(folder.name).groups()
+    plist = folder / "info.plist"
+    if plist.is_file() and not plist.is_symlink():
+        with plist.open("rb") as stream:
+            workspace = plistlib.load(stream).get("WorkspacePath")
+        if not isinstance(workspace, str) or xcode_path_hash(workspace) != suffix:
+            return None, "info.plist does not match the folder name"
+        checkout = worktree_of(Path(os.path.realpath(workspace)))
+        return checkout, None if checkout else "built from outside the T3 worktrees"
+    # A build that stops early leaves Logs and SourcePackages without info.plist.
+    owners = set()
+    for checkout in snapshot.threads:
+        if worktree_of(checkout) == checkout and review.directory(checkout):
+            if any(xcode_path_hash(str(path)) == suffix
+                   for path in candidate_workspaces(checkout, name, listings)):
+                owners.add(checkout)
+    if len(owners) == 1:
+        return owners.pop(), None
+    return None, "no info.plist and no single T3 worktree matches the folder name"
+
+
+def check_derived(folder, expected, checkout, grace):
+    if identity(folder) != expected:
+        return "folder was replaced"
+    snapshot = review.load_t3(DB)
+    if snapshot.has_unmapped_legacy_threads:
+        return "no complete T3 ownership"
+    if checkout in snapshot.projects or any(review.overlaps(folder, p)
+                                            for p in (*snapshot.projects, *snapshot.threads)):
+        return "folder belongs to or overlaps a T3 project checkout"
+    if snapshot.threads.get(checkout):
+        return settled_threads(snapshot, checkout, grace)
+    if checkout.exists() or checkout.is_symlink():
+        return "worktree exists without T3 ownership"
+    # A removed worktree with no remaining threads has no owner left to protect.
+    return None
+
+
+def sweep_derived_data(cfg, apply, sweep_id, entries):
+    root = xcode_derived_data()
+    if root is None or not root.exists():
+        return
+    try:
+        directory(root)
+        managed = build_workspaces(cfg)
+        for protected in (WORKTREES, T3_SCRATCH, ROOT, REPORT.parent, *([managed] if managed else [])):
+            if review.overlaps(root, protected):
+                raise ValueError(f"Xcode DerivedData overlaps managed or T3 storage: {protected}")
+        snapshot = review.load_t3(DB)
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError,
+            review.sqlite3.Error, subprocess.SubprocessError) as exc:
+        entries.append({"kind": "derived-data", "path": str(root), "status": "keep", "reason": str(exc)})
+        return
+    listings = {}
+    for folder in sorted(root.iterdir()):
+        if folder.name.startswith(RETIRED_DERIVED):
+            entries.append({"kind": "derived-data", "path": str(folder), "status": "staged",
+                            "reason": "interrupted cleanup; preserved for manual review"})
+            continue
+        if not DERIVED_FOLDER.fullmatch(folder.name) or folder.is_symlink() or not folder.is_dir():
+            continue
+        entry = {"kind": "derived-data", "path": str(folder), "status": "keep"}
+        entries.append(entry)
+        try:
+            inspect_derived(cfg, apply, sweep_id, root, folder, snapshot, listings, entry)
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError, plistlib.InvalidFileException,
+                review.sqlite3.Error, subprocess.SubprocessError) as exc:
+            entry["reason"] = str(exc)
+
+
+def inspect_derived(cfg, apply, sweep_id, root, folder, snapshot, listings, entry):
+    checkout, reason = derived_data_owner(folder, snapshot, listings)
+    if checkout is None:
+        entry["reason"] = reason
+        return
+    entry["checkout"] = str(checkout)
+    grace = cfg["settlement_grace_seconds"]
+    expected = identity(folder)
+    reason = check_derived(folder, expected, checkout, grace) or open_or_mounted(folder)
+    if reason:
+        entry["reason"] = reason
+        return
+    entry["allocated_kib"] = review.size_kib(folder)
+    if not apply:
+        entry["status"] = "eligible"
+        return
+    if not sweep_id:
+        raise ValueError("Deletion requires a sweep audit ID")
+    parked = root / (RETIRED_DERIVED + uuid.uuid4().hex)
+    evidence = {"kind": "derived-data", "path": str(folder), "checkout": entry["checkout"],
+                "staged_path": str(parked), "allocated_kib": entry["allocated_kib"],
+                "reason": "built from a T3 worktree whose threads settled; no detected open files"}
+    audit("delete_intent", sweep_id, **evidence)
+    reason = check_derived(folder, expected, checkout, grace)
+    if reason:
+        entry["reason"] = reason
+        audit("delete_cancelled", sweep_id, **dict(evidence, reason=reason))
+        return
+    # Detach the folder first so a build that starts now gets a fresh folder instead of a half-deleted one.
+    folder.rename(parked)
+    entry.update(status="staged", staged_path=str(parked))
+    try:
+        reason = open_or_mounted(parked) or check_derived(parked, expected, checkout, grace)
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError,
+            review.sqlite3.Error, subprocess.SubprocessError) as exc:
+        reason = str(exc)
+    if reason:
+        entry["reason"] = reason
+        if restore_build(parked, folder):
+            entry["status"] = "keep"
+            entry.pop("staged_path")
+        audit("delete_cancelled", sweep_id, **dict(evidence, reason=reason))
+        return
+    try:
+        shutil.rmtree(parked)
+    except OSError as exc:
+        entry["reason"] = str(exc)
+        audit("delete_failed", sweep_id, **dict(evidence, reason=str(exc)))
+        return
+    entry["status"] = "deleted"
+    audit("deleted", sweep_id, **evidence)
+
+
 def report_paths(cfg):
     paths = cfg.get("report_paths") or list(DEFAULT_REPORT_PATHS)
     if cfg.get("build_artifacts_root"):
@@ -908,6 +1083,7 @@ def sweep(cfg, apply, sweep_id=None):
     sweep_builds(cfg, apply, sweep_id, result["entries"])
     sweep_project_files(cfg, apply, sweep_id, result["entries"])
     sweep_evidence(cfg, apply, sweep_id, result["entries"])
+    sweep_derived_data(cfg, apply, sweep_id, result["entries"])
     return result
 
 
@@ -1059,7 +1235,8 @@ def config_details(cfg):
             "build_artifacts_root": cfg.get("build_artifacts_root"),
             "project_cleanup": cfg.get("project_cleanup", {}),
             "evidence_retention_days": cfg["evidence_retention_days"],
-            "report_paths": report_paths(cfg), "size_history": str(sizes_file())}
+            "report_paths": report_paths(cfg), "size_history": str(sizes_file()),
+            "xcode_derived_data": str(xcode_derived_data() or "")}
 
 
 def status():
@@ -1173,6 +1350,8 @@ def main():
                       else "Run evidence: kept until removed by hand")
                 if cfg.get("build_artifacts_root"):
                     print(f"Build artifacts: {cfg['build_artifacts_root']}")
+                print("Xcode DerivedData: " + (result["xcode_derived_data"] or "inside each workspace")
+                      + " (folders built from settled T3 worktrees)")
                 for project, patterns in sorted(result["project_cleanup"].items()):
                     print(f"Project {project}: " + ", ".join(patterns))
                 print("\n".join(result["pools"]) or "(no pools configured)")
