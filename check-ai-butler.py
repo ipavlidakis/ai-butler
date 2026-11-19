@@ -23,6 +23,7 @@ spec.loader.exec_module(butler)
 with tempfile.TemporaryDirectory(dir=sys.argv[1]) as temporary:
     base = Path(temporary).resolve()
     butler.HOME = base
+    butler.xcode_derived_data = lambda: base / "DerivedData"  # Never read the real Xcode folder.
     butler.ROOT = base / "scratch"
     butler.CONFIG = base / "config" / "config.json"
     butler.PLIST = base / "agents" / (butler.LABEL + ".plist")

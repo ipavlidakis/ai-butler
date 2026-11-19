@@ -1,8 +1,9 @@
 # AI Butler
 
-AI Butler is a macOS CLI that cleans up temporary files and, with startup
-hooks enabled, build output owned by T3 worktrees. Source worktrees, shared
-caches, device state, and older unregistered data stay outside its scope.
+AI Butler is a macOS CLI that cleans up temporary files, Xcode DerivedData
+built from T3 worktrees and, with startup hooks enabled, build output owned by
+T3 worktrees. Source worktrees, shared caches, device state, and older
+unregistered data stay outside its scope.
 
 ## What is a scratch pool?
 
@@ -71,6 +72,37 @@ older workspaces and main checkouts alone. Run evidence follows its own
 retention rule below. Set a private storage location with
 `install --hooks --artifact-root <path>`, or use the default under macOS
 Application Support. Use `preview` to inspect eligibility.
+
+## Xcode DerivedData
+
+Tools such as Fastlane build into Xcode's DerivedData folder unless they are
+given another path. AI Butler checks that folder on every sweep. No setup is
+needed. It uses the location set in Xcode (`IDECustomDerivedDataLocation`) or
+`~/Library/Developer/Xcode/DerivedData`. If Xcode keeps DerivedData inside
+each workspace, the output leaves with the worktree and there is nothing to
+check.
+
+Xcode names each folder `<Name>-<hash>`, where the hash comes from the path of
+the project, workspace or package that was built. AI Butler finds that path in
+the folder's `info.plist` (`WorkspacePath`) and checks that its hash matches
+the folder name. A build that stops early leaves no `info.plist`. For those
+folders, AI Butler hashes the projects, workspaces and package folders in each
+T3 worktree with that name, and accepts exactly one match.
+
+A folder is removed only when all of these are true:
+
+- It was built from a T3 worktree under `~/workspace/worktrees`.
+- Every T3 thread for that worktree, and its descendants, is settled past the
+  grace period. If the worktree and all its threads are gone, the folder is an
+  orphan and is removed.
+- `lsof` reports no open files in it.
+
+Folders built from main checkouts or other paths, folders that can't be
+attributed, and shared folders such as `ModuleCache.noindex` are kept. Test
+results that Xcode stored inside the folder are removed with it, so copy what
+you need first. AI Butler moves the folder aside before the last check, so a
+new build gets a fresh folder. Each deletion gets an intent and an outcome
+record in the audit log.
 
 ## Run evidence retention
 

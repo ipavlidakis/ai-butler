@@ -47,6 +47,8 @@ with tempfile.TemporaryDirectory(dir=args.fixture_parent) as temp:
     scratch.ROOT = base / "disposable-scratch"
     scratch.ROOT.mkdir()
     scratch.WORKTREES = base / "worktrees"
+    derived = base / "DerivedData"
+    scratch.xcode_derived_data = lambda: derived  # Never read the real Xcode folder.
     checkout = scratch.WORKTREES / "demo" / "feature"
     checkout.mkdir(parents=True)
     scratch.DB = base / "test.sqlite"
@@ -343,6 +345,69 @@ with tempfile.TemporaryDirectory(dir=args.fixture_parent) as temp:
               for line in path.read_text().splitlines()]
     assert [e["event"] for e in events if e.get("path") == str(run_dir)] == ["delete_intent", "deleted"]
 
+    # Xcode DerivedData: folders are attributed to the T3 worktree they were built from.
+    import plistlib
+    expected_hash = "bpoaeuazmnwwodafvpsgzlsvxefp"  # Observed from Xcode 27.2 for this path.
+    assert scratch.xcode_path_hash("/tmp/claude-501/-Users-ipavlidakis--t3-scratch-2026-11-18-go-through-the-t3-"
+                                   "thread-81b3deff/835d9395-c074-41a5-b0d5-7c7d7f3d97dd/scratchpad/ddprobe") == expected_hash
+    derived.mkdir()
+    (derived / "ModuleCache.noindex").mkdir()
+
+    def built(workspace, plist=True, name=None):
+        name = name or Path(workspace).stem
+        folder = derived / f"{name}-{scratch.xcode_path_hash(str(workspace))}"
+        (folder / "Build").mkdir(parents=True)
+        (folder / "Build" / "out.o").write_bytes(b"\0" * 4096)
+        if plist:
+            with (folder / "info.plist").open("wb") as stream:
+                plistlib.dump({"WorkspacePath": str(workspace)}, stream)
+        return folder
+
+    def derived_rows(apply):
+        return {Path(r["path"]).name: r for r in scratch.sweep(cfg, apply, sweep_id="dd-fixture")["entries"]
+                if r.get("kind") == "derived-data"}
+
+    app = built(checkout / "App.xcodeproj")
+    outside = built(base / "main" / "App.xcodeproj", name="Main")
+    mismatched = built(checkout / "Other.xcodeproj")
+    mismatched.rename(derived / ("Other-" + "a" * 28))
+    mismatched = derived / ("Other-" + "a" * 28)
+    orphan = built(scratch.WORKTREES / "demo" / "gone" / "App.xcodeproj", name="Gone")
+    package_tree = scratch.WORKTREES / "demo" / "package"
+    (package_tree / "Pkg").mkdir(parents=True)
+    (package_tree / "Pkg" / "Package.swift").write_text("// swift-tools-version:5.9\n")
+    for tree in (package_tree, checkout):
+        subprocess.run(["git", "init", "-q", str(tree)], check=True)
+    register_thread("pkg", settled_at, package_tree)
+    no_plist = built(package_tree / "Pkg", plist=False)
+    unmatched = built(package_tree / "Missing", plist=False)
+    staged = derived / (scratch.RETIRED_DERIVED + "leftover")
+    staged.mkdir()
+
+    register_thread("child", None)
+    rows = derived_rows(True)
+    assert "ModuleCache.noindex" not in rows
+    assert "not settled" in rows[app.name]["reason"], rows[app.name]
+    assert "outside the T3 worktrees" in rows[outside.name]["reason"]
+    assert "does not match" in rows[mismatched.name]["reason"]
+    assert "no single T3 worktree" in rows[unmatched.name]["reason"], rows[unmatched.name]
+    assert rows[staged.name]["status"] == "staged"
+    assert rows[orphan.name]["status"] == "deleted" and not orphan.exists()
+    assert rows[no_plist.name]["status"] == "deleted" and not no_plist.exists()
+    register_thread("child", settled_at)
+    (app / "Build" / "open-fixture").touch()
+    with (app / "Build" / "open-fixture").open():
+        assert "open files" in derived_rows(True)[app.name]["reason"]
+    assert derived_rows(False)[app.name]["status"] == "eligible" and app.exists()
+    row = derived_rows(True)[app.name]
+    assert row["status"] == "deleted" and row["checkout"] == str(checkout) and not app.exists()
+    assert outside.exists() and mismatched.exists() and unmatched.exists() and staged.exists()
+    assert (derived / "ModuleCache.noindex").exists()
+    events = [json.loads(line) for path in scratch.AUDIT_DIR.glob("*.jsonl")
+              for line in path.read_text().splitlines()]
+    for folder in (app, orphan, no_plist):
+        assert [e["event"] for e in events if e.get("path") == str(folder)] == ["delete_intent", "deleted"]
+
     # Storage report: sizes are recorded per sweep and compared with a fresh measurement.
     grown = base / "grown"
     grown.mkdir()
@@ -366,3 +431,4 @@ print("PASS: opted-in allocation, settlement, shared checkout, queued run, detac
 print("PASS: hook-allocated build cache, shared owners, evidence, aliases, audit and resumed threads")
 print("PASS: project stray files: unsafe patterns, owner attribution, orphans, settlement, grace, open file, audit")
 print("PASS: evidence retention: age, settlement, open file, disabled, preview, audit; storage report history")
+print("PASS: Xcode DerivedData: info.plist and hash attribution, outside and mismatched folders, orphans, settlement, open file, audit")
