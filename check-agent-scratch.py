@@ -29,8 +29,12 @@ real_run = subprocess.run
 
 
 def fixture_process_check(command, **kwargs):
-    if command[0] == "/usr/sbin/lsof" and not any(Path(command[-1]).rglob("open-fixture")):
-        return subprocess.CompletedProcess(command, 1, b"", b"")
+    # Report only the fixture's deliberately opened file, so unrelated processes cannot affect results.
+    if command[0] == "/usr/sbin/lsof":
+        result = real_run(command, **kwargs)
+        kept = [line for line in result.stdout.splitlines()
+                if not line.startswith(b"n") or line.endswith(b"/open-fixture")]
+        return subprocess.CompletedProcess(command, result.returncode, b"\n".join(kept), result.stderr)
     return real_run(command, **kwargs)
 
 
