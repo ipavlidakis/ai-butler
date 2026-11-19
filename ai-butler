@@ -45,6 +45,12 @@ SERVICE_COMMAND = ["/usr/bin/python3", str(SCRIPT)]  # The Homebrew formula uses
 DEFAULT_INTERVAL = 60
 DEFAULT_GRACE = 5
 DEFAULT_RETENTION = 7
+DEFAULT_EVIDENCE_RETENTION = 7
+DATA_VOLUME = Path("/System/Volumes/Data")
+# Large locations agents grow outside AI Butler's deletion scope. The report only measures them.
+DEFAULT_REPORT_PATHS = ("~/Library/Developer/Xcode/DerivedData", "~/Library/Developer/CoreSimulator",
+                        "/System/Library/AssetsV2", "~/.simlock", "~/Library/Caches/org.swift.swiftpm",
+                        "~/.gradle", "~/.local/share/containers", "~/workspace/worktrees")
 MAX_MINUTES = (2**31 - 1) // 60
 DB = HOME / ".t3/userdata/statev2.sqlite"
 WORKTREES = HOME / "workspace/worktrees"
@@ -62,11 +68,19 @@ def settings(missing_ok=True):
         if not missing_ok:
             raise
         return {"pools": ["tmp"], "settlement_grace_seconds": DEFAULT_GRACE * 60,
-                "interval_minutes": DEFAULT_INTERVAL, "log_retention_days": DEFAULT_RETENTION}
+                "interval_minutes": DEFAULT_INTERVAL, "log_retention_days": DEFAULT_RETENTION,
+                "evidence_retention_days": DEFAULT_EVIDENCE_RETENTION}
     pools = cfg["pools"]
     grace = cfg["settlement_grace_seconds"]
     interval = cfg["interval_minutes"]
     retention = cfg.setdefault("log_retention_days", DEFAULT_RETENTION)
+    evidence = cfg.setdefault("evidence_retention_days", DEFAULT_EVIDENCE_RETENTION)
+    report_paths = cfg.get("report_paths", [])
+    if (type(evidence) is not int or not 0 <= evidence <= 36500
+            or not isinstance(report_paths, list)
+            or any(not isinstance(p, str) or not Path(p).expanduser().is_absolute()
+                   for p in report_paths)):
+        raise ValueError("Invalid evidence retention or report paths in " + str(CONFIG))
     projects = cfg.get("project_cleanup", {})
     if (not isinstance(pools, list)
             or any(not isinstance(p, str) or not POOL_NAME.fullmatch(p) for p in pools)
@@ -673,6 +687,163 @@ def configure_project(cfg, project, value, add):
     write_json(CONFIG, cfg)
 
 
+def newest_change(path):
+    """Return the latest modification time of any entry in `path`, without following links."""
+    newest = path.lstat().st_mtime
+    for base, dirs, files in os.walk(path, followlinks=False):
+        for name in dirs + files:
+            newest = max(newest, (Path(base) / name).lstat().st_mtime)
+    return newest
+
+
+def evidence_owner_state(checkout, grace):
+    snapshot = review.load_t3(DB)
+    if snapshot.has_unmapped_legacy_threads:
+        return "no complete T3 ownership"
+    if snapshot.threads.get(checkout):
+        return settled_threads(snapshot, checkout, grace)
+    if checkout in snapshot.projects or not (checkout.exists() or checkout.is_symlink()):
+        # A main checkout has no per-thread record, and a removed worktree has no owner left.
+        # Both rely on the retention age and the open-file check.
+        return None
+    return "checkout exists without T3 ownership"
+
+
+def check_evidence(workspace, run, days, grace):
+    directory(run)
+    owner = read_local_json(run / "owner.json")
+    if owner["checkout"] != read_local_json(workspace / "owner.json")["checkout"]:
+        return "run ownership does not match its workspace"
+    if newest_change(run) > time.time() - days * 86400:
+        return f"evidence changed within the last {days} days"
+    return evidence_owner_state(Path(owner["checkout"]), grace)
+
+
+def sweep_evidence(cfg, apply, sweep_id, entries):
+    days = cfg["evidence_retention_days"]
+    managed = build_workspaces(cfg)
+    if not days or managed is None or not managed.exists():
+        return
+    grace = cfg["settlement_grace_seconds"]
+    for workspace in sorted(directory(managed).glob("*/*")):
+        runs = workspace / "runs"
+        if not review.directory(workspace) or not review.directory(runs):
+            continue
+        for run in sorted(runs.iterdir()):
+            entry = {"kind": "evidence", "path": str(run), "status": "keep"}
+            entries.append(entry)
+            try:
+                reason = check_evidence(workspace, run, days, grace) or open_or_mounted(run)
+                if reason:
+                    entry["reason"] = reason
+                    continue
+                entry["allocated_kib"] = review.size_kib(run)
+                if not apply:
+                    entry["status"] = "eligible"
+                    continue
+                if not sweep_id:
+                    raise ValueError("Deletion requires a sweep audit ID")
+                evidence = {"kind": "evidence", "path": str(run), "allocated_kib": entry["allocated_kib"],
+                            "reason": f"unchanged for {days} days, owners settled, no detected open files"}
+                audit("delete_intent", sweep_id, **evidence)
+                reason = check_evidence(workspace, run, days, grace) or open_or_mounted(run)
+                if reason:
+                    entry["reason"] = reason
+                    audit("delete_cancelled", sweep_id, **dict(evidence, reason=reason))
+                    continue
+                shutil.rmtree(run)
+                entry["status"] = "deleted"
+                audit("deleted", sweep_id, **evidence)
+            except (OSError, ValueError, KeyError, TypeError, RuntimeError,
+                    review.sqlite3.Error, subprocess.SubprocessError) as exc:
+                entry["reason"] = str(exc)
+
+
+def report_paths(cfg):
+    paths = cfg.get("report_paths") or list(DEFAULT_REPORT_PATHS)
+    if cfg.get("build_artifacts_root"):
+        paths = [cfg["build_artifacts_root"], *paths]
+    return list(dict.fromkeys(str(Path(p).expanduser()) for p in paths))
+
+
+def measure_sizes(cfg):
+    volume = DATA_VOLUME if DATA_VOLUME.is_dir() else Path("/")
+    # statvfs reports the whole APFS container. df reports the volume's own use.
+    df = subprocess.run(["/bin/df", "-k", str(volume)], capture_output=True, text=True, timeout=30, check=True)
+    volume_used = int(df.stdout.splitlines()[1].split()[2])
+    sizes = {}
+    for path in report_paths(cfg):
+        if not os.path.lexists(path):
+            sizes[path] = None
+            continue
+        result = subprocess.run(["/usr/bin/du", "-sk", path], capture_output=True, text=True, timeout=300)
+        # du reports unreadable entries on stderr but still prints a usable total.
+        sizes[path] = int(result.stdout.split()[0]) if result.stdout.strip() else None
+    return {"at": datetime.now(timezone.utc).isoformat(),
+            "data_volume_used_kib": volume_used,
+            "paths": sizes}
+
+
+def sizes_file():
+    return REPORT.parent / "sizes.jsonl"
+
+
+def record_sizes(cfg):
+    path = sizes_file()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=cfg["log_retention_days"])
+    kept = [line for line in (path.read_text().splitlines() if path.exists() else [])
+            if datetime.fromisoformat(json.loads(line)["at"]) >= cutoff]
+    write_file(path, ("\n".join([*kept, json.dumps(measure_sizes(cfg))]) + "\n").encode())
+
+
+def parse_since(value):
+    if value is None:
+        return None
+    match = re.fullmatch(r"(\d+)([hd])", value)
+    if match:
+        unit = 3600 if match.group(2) == "h" else 86400
+        return datetime.now(timezone.utc) - timedelta(seconds=int(match.group(1)) * unit)
+    moment = datetime.fromisoformat(value)
+    return moment if moment.tzinfo else moment.astimezone()
+
+
+def storage_report(cfg, since):
+    path = sizes_file()
+    records = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+    if since is not None:
+        records = [r for r in records if datetime.fromisoformat(r["at"]) >= since]
+    baseline = records[0] if records else None
+    current = measure_sizes(cfg)
+    rows = []
+    for path_name, now in current["paths"].items():
+        before = baseline["paths"].get(path_name) if baseline else None
+        change = None if now is None or before is None else now - before
+        rows.append({"path": path_name, "baseline_kib": before, "now_kib": now, "change_kib": change})
+    rows.sort(key=lambda row: -(row["change_kib"] or 0))
+    volume_before = baseline["data_volume_used_kib"] if baseline else None
+    return {"baseline_at": baseline["at"] if baseline else None, "now_at": current["at"],
+            "data_volume": {"baseline_kib": volume_before, "now_kib": current["data_volume_used_kib"],
+                            "change_kib": None if volume_before is None
+                            else current["data_volume_used_kib"] - volume_before},
+            "paths": rows}
+
+
+def format_kib(value):
+    return "-" if value is None else f"{value / 1048576:.2f} GiB"
+
+
+def print_storage_report(result):
+    print(f"Baseline: {result['baseline_at'] or '(no recorded sweep yet)'}\nNow:      {result['now_at']}")
+    volume = result["data_volume"]
+    change = volume["change_kib"]
+    print(f"Data volume used: {format_kib(volume['now_kib'])}"
+          + ("" if change is None else f" (change {change / 1048576:+.2f} GiB)"))
+    for row in result["paths"]:
+        change = row["change_kib"]
+        print(f"{format_kib(row['now_kib']):>12}  "
+              f"{'' if change is None else f'{change / 1048576:+.2f} GiB':>12}  {row['path']}")
+
+
 def sweep(cfg, apply, sweep_id=None):
     if not shutil.rmtree.avoids_symlink_attacks:
         raise RuntimeError("This Python does not support symlink-safe directory removal")
@@ -736,6 +907,7 @@ def sweep(cfg, apply, sweep_id=None):
                 entry["reason"] = str(exc)
     sweep_builds(cfg, apply, sweep_id, result["entries"])
     sweep_project_files(cfg, apply, sweep_id, result["entries"])
+    sweep_evidence(cfg, apply, sweep_id, result["entries"])
     return result
 
 
@@ -885,7 +1057,9 @@ def config_details(cfg):
             "launch_agent": str(PLIST), "latest_sweep_file": str(REPORT),
             "audit_directory": str(AUDIT_DIR), "log_retention_days": cfg["log_retention_days"],
             "build_artifacts_root": cfg.get("build_artifacts_root"),
-            "project_cleanup": cfg.get("project_cleanup", {})}
+            "project_cleanup": cfg.get("project_cleanup", {}),
+            "evidence_retention_days": cfg["evidence_retention_days"],
+            "report_paths": report_paths(cfg), "size_history": str(sizes_file())}
 
 
 def status():
@@ -913,6 +1087,11 @@ def scheduled_sweep():
         result = {"mode": "automatic", "generated_at": datetime.now().astimezone().isoformat(),
                   "error": str(error), "entries": []}
         failed = True
+    else:
+        try:
+            record_sizes(cfg)
+        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+            result["size_record_error"] = str(error)
     ensure_directory(REPORT.parent)
     result["sweep_id"] = sweep_id
     write_json(REPORT, result)
@@ -936,6 +1115,12 @@ def main():
     commands.add_parser("setInterval", help="Set sweep interval in minutes (0 resets to 60)").add_argument("minutes", type=int)
     commands.add_parser("setSettlementGracePeriod", help="Set settlement grace in minutes").add_argument("minutes", type=int)
     commands.add_parser("setLogRetention", help="Set audit retention in days (default 7)").add_argument("days", type=int)
+    commands.add_parser("setEvidenceRetention",
+                        help="Delete run evidence this many days after it last changed (default 7, 0 keeps it)"
+                        ).add_argument("days", type=int)
+    report = commands.add_parser("report", help="Show storage growth of known large locations; remove nothing")
+    report.add_argument("--since", help="ISO time, or a duration such as 6h or 2d (default: oldest record)")
+    report.add_argument("--json", action="store_true")
     for name, text in (("addProjectCleanup", "Clean a project's stray files after its worktree settles"),
                        ("removeProjectCleanup", "Stop cleaning a project's stray-file pattern")):
         project = commands.add_parser(name, help=text)
@@ -966,6 +1151,15 @@ def main():
             configure_storage(settings())
             print(json.dumps(status(), indent=2))
             return 0
+        if action == "report":
+            cfg = settings()
+            configure_storage(cfg)
+            result = storage_report(cfg, parse_since(options.since))
+            if options.json:
+                print(json.dumps(result, indent=2))
+            else:
+                print_storage_report(result)
+            return 0
         if action in ("list", "preview"):
             cfg = settings()
             configure_storage(cfg)
@@ -974,6 +1168,9 @@ def main():
                 print(f"Config: {CONFIG}\nSweep: {cfg['interval_minutes']} min; "
                       f"settlement grace: {cfg['settlement_grace_seconds'] // 60} min")
                 print(f"Audit logs: {AUDIT_DIR} ({cfg['log_retention_days']} days)")
+                days = cfg["evidence_retention_days"]
+                print(f"Run evidence: deleted {days} days after its last change" if days
+                      else "Run evidence: kept until removed by hand")
                 if cfg.get("build_artifacts_root"):
                     print(f"Build artifacts: {cfg['build_artifacts_root']}")
                 for project, patterns in sorted(result["project_cleanup"].items()):
@@ -1018,6 +1215,11 @@ def main():
                 if not 1 <= options.days <= 36500:
                     raise ValueError("Days must be between 1 and 36500")
                 cfg["log_retention_days"] = options.days
+                write_json(CONFIG, cfg)
+            elif action == "setEvidenceRetention":
+                if not 0 <= options.days <= 36500:
+                    raise ValueError("Days must be between 0 and 36500")
+                cfg["evidence_retention_days"] = options.days
                 write_json(CONFIG, cfg)
             else:
                 minutes = options.minutes

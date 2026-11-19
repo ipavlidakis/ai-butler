@@ -66,10 +66,49 @@ For example:
   packages and deliverables outside the build directory.
 
 Only workspaces newly allocated by this hook can opt in. The sweeper uses
-the T3 worktree root at `~/workspace/worktrees` and leaves older workspaces,
-main checkouts, run results, and retained deliverables alone. Set a private
-storage location with `install --hooks --artifact-root <path>`, or use the
-default under macOS Application Support. Use `preview` to inspect eligibility.
+the T3 worktree root at `~/workspace/worktrees` and leaves the build output of
+older workspaces and main checkouts alone. Run evidence follows its own
+retention rule below. Set a private storage location with
+`install --hooks --artifact-root <path>`, or use the default under macOS
+Application Support. Use `preview` to inspect eligibility.
+
+## Run evidence retention
+
+Each agent session keeps its logs, results and screenshots in its own
+`runs/<session>` folder in the artifact workspace. The sweep deletes a run
+folder when all of these are true:
+
+- Nothing in it changed in the last 7 days. Change the period with
+  `ai-butler setEvidenceRetention <days>`. Use `0` to keep evidence until you
+  remove it.
+- The run's owner record matches its workspace.
+- For a T3 worktree, every T3 thread for it, and its descendants, is settled
+  past the grace period. A main checkout has no thread record, and a removed
+  worktree has no owner left. For those, only the age and open-file checks apply.
+- `lsof` reports no open files in the folder.
+
+Each deletion gets an intent and an outcome in the audit log. Copy anything you
+need to keep, such as PR evidence, out of the run folder before the period ends.
+
+## Storage report
+
+`ai-butler report` shows how much large locations have grown, and removes
+nothing. Each scheduled sweep records the size of the artifact root and these
+locations:
+
+- `~/Library/Developer/Xcode/DerivedData`
+- `~/Library/Developer/CoreSimulator`
+- `/System/Library/AssetsV2` (simulator runtimes)
+- `~/.simlock`
+- `~/Library/Caches/org.swift.swiftpm`
+- `~/.gradle`
+- `~/.local/share/containers` (container VMs)
+- `~/workspace/worktrees`
+
+The report compares a fresh measurement with the oldest record, or with the
+first record after `--since <ISO time | 6h | 2d>`. It also shows the Data
+volume's use as `df` reports it. Set `report_paths` in the local config to
+measure other absolute paths. The history follows the audit log retention.
 
 ## Project stray files
 
@@ -138,6 +177,8 @@ while its LaunchAgent is installed.
 | `setSettlementGracePeriod <minutes>` | Change the minimum time after both the foreground command finishes and T3 settles its thread. Keep the prototype's five-minute default. If work resumes, recalculate eligibility from the new settlement. |
 | `addProjectCleanup <project> <pattern>` | Clean a project's stray tool output after the worktree it names settles. See [Project stray files](#project-stray-files). |
 | `removeProjectCleanup <project> <pattern>` | Stop cleaning that pattern. Matching files stay on disk. |
+| `setEvidenceRetention <days>` | Delete a run evidence folder this many days after its last change, once its owners settle. Default: seven. `0` keeps evidence. |
+| `report [--since <time>] [--json]` | Show the growth of known large storage locations since a recorded sweep. Removes nothing. |
 | `setLogRetention <days>` | Keep that many calendar days of audit logs, including today (UTC). Default: seven. Expired logs are removed on the next scheduled sweep. |
 | `run [--thread <id>] [--pool <name>] -- <command>` | From the T3 checkout, opt in one foreground command. Uses `T3CODE_THREAD_ID` by default. |
 | `preview` | List what a sweep would keep or remove, with reasons, without deleting data. |
