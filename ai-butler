@@ -62,6 +62,25 @@ OWNER_SCAN_BYTES = 64 * 1024
 XCODE_DEFAULT_DERIVED_DATA = HOME / "Library/Developer/Xcode/DerivedData"
 DERIVED_FOLDER = re.compile(r"(.+)-([a-z]{28})")
 RETIRED_DERIVED = ".ai-butler-retired-"
+DERIVED_OWNERS = "derived-data-owners.json"
+# Build output that tools write inside a checkout when no output path is given.
+CHECKOUT_BUILD_NAMES = (".build", "DerivedData")
+# T3 runs Antigravity with a private GEMINI_HOME per provider instance.
+T3_ANTIGRAVITY_PROFILES = HOME / ".t3/userdata/providers/antigravity"
+HOOK_NAMES = {"artifacts": "ai-butler-artifacts", "guard": "ai-butler-xcodebuild-guard"}
+# xcodebuild actions that never open a workspace, so they never create DerivedData.
+XCODEBUILD_INFO_FLAGS = {"-version", "-showsdks", "-help", "-usage", "-license", "-checkFirstLaunchStatus",
+                         "-runFirstLaunch", "-downloadPlatform", "-downloadAllPlatforms", "-downloadComponent",
+                         "-importPlatform", "-importComponent", "-showComponent"}
+XCODEBUILD_CALL = re.compile(
+    r"(?:^|[;&|(`\n]|\$\()\s*"                      # start of a simple command
+    r"(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*"            # VAR=value prefixes
+    r"(?:(?:env|time|exec|command|nohup|xcrun|caffeinate(?:\s+-\w+)*|timeout\s+\S+)\s+)*"
+    r"(?:\S*/)?xcodebuild(?=\s|$|[;&|)`])([^;&|\n`)]*)")
+GUARD_MESSAGE = ("AI Butler blocked this xcodebuild call: pass -derivedDataPath \"$AGENT_XCODE_DIR/<name>\" "
+                 "after sourcing this run's env.sh. Without it Xcode writes to "
+                 "~/Library/Developer/Xcode/DerivedData, outside this task's cleanup. "
+                 "This also applies to -list, -showBuildSettings and -resolvePackageDependencies.")
 
 
 def settings(missing_ok=True):
@@ -288,7 +307,87 @@ def open_or_mounted(data, preserve_evidence=False):
                 return "build directory contains a test result, archive, or export"
             if (Path(base) / name).lstat().st_dev != device:
                 return "scratch contains another filesystem"
-    return open_under(data, "open files or incomplete process check")
+    return open_under(data, OPEN_FILES)
+
+
+OPEN_FILES = "open files or incomplete process check"
+
+
+def within(path, root):
+    return path == root or root in path.parents
+
+
+def open_holders(path):
+    """PIDs with files open under `path`, or None when the system-wide listing is incomplete."""
+    opened = subprocess.run(["/usr/sbin/lsof", "-nP", "-F", "pn"], capture_output=True, timeout=60)
+    if opened.returncode != 0 or opened.stderr:
+        return None
+    target = os.fsencode(os.path.realpath(path))
+    pid, holders = None, set()
+    for line in opened.stdout.splitlines():
+        if line[:1] == b"p":
+            pid = int(line[1:])
+        elif line[:1] == b"n" and (line[1:] == target or line[1:].startswith(target + b"/")):
+            holders.add(pid)
+    return holders
+
+
+def process_details(pid):
+    """(parent pid, uid, command, cwd) of a live process, or None."""
+    info = subprocess.run(["/bin/ps", "-o", "ppid=,uid=,command=", "-p", str(pid)],
+                          capture_output=True, text=True, timeout=10)
+    fields = info.stdout.strip().split(None, 2)
+    if info.returncode != 0 or len(fields) < 3:
+        return None
+    found = subprocess.run(["/usr/sbin/lsof", "-a", "-nP", "-p", str(pid), "-d", "cwd", "-F", "n"],
+                           capture_output=True, text=True, timeout=10)
+    cwd = next((line[1:] for line in found.stdout.splitlines() if line.startswith("n")), None)
+    return int(fields[0]), int(fields[1]), fields[2], cwd
+
+
+def stop_orphans(path, roots, apply, sweep_id, evidence):
+    """Stop orphaned processes left behind by a settled task that keep files under `path` open.
+
+    A hung test helper or build daemon outlives its agent and is re-parented to launchd, which blocks
+    cleanup forever. Every holder must be one of ours, orphaned, and running from or naming one of
+    `roots`; otherwise nothing is stopped. Returns a reason to keep the path, or None once they exited.
+    """
+    holders = open_holders(path)
+    if not holders or os.getpid() in holders:
+        return OPEN_FILES
+    roots = [Path(os.path.realpath(root)) for root in roots]
+    found = []
+    for pid in sorted(holders):
+        details = process_details(pid)
+        if details is None:
+            return OPEN_FILES
+        ppid, uid, command, cwd = details
+        named = any(str(root) in command for root in roots)
+        inside = cwd is not None and any(within(Path(os.path.realpath(cwd)), root) for root in roots)
+        if ppid != 1 or uid != os.getuid() or not (named or inside):
+            return OPEN_FILES
+        found.append({"pid": pid, "command": command[:500], "cwd": cwd})
+    if not apply:
+        return f"held open by {len(found)} orphaned process(es) that the next sweep stops"
+    audit("stop_orphans", sweep_id, **dict(evidence, processes=found))
+    for process in found:
+        try:
+            os.kill(process["pid"], 15)
+        except ProcessLookupError:
+            pass
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        alive = []
+        for process in found:
+            try:
+                os.kill(process["pid"], 0)
+                alive.append(process)
+            except ProcessLookupError:
+                pass
+        if not alive:
+            return None
+        time.sleep(0.5)
+    return "orphaned processes did not exit after SIGTERM"
 
 
 def open_under(path, reason):
@@ -332,14 +431,14 @@ def artifact_hook(options):
     provider = options.provider
     if provider == "claude" and (payload.get("cursor_version") or os.getenv("CURSOR_VERSION")):
         provider = "cursor"
-    roots = payload.get("workspace_roots") or []
+    roots = payload.get("workspace_roots") or payload.get("workspacePaths") or []
     cwd = Path(options.cwd or payload.get("cwd") or (roots[0] if roots else Path.cwd()))
     cwd = cwd.resolve(strict=True)
     if not cwd.is_dir():
         raise ValueError("Hook checkout must be a directory")
     checkout = next((p for p in (cwd, *cwd.parents) if (p / ".git").exists()), cwd)
     session = (options.session or payload.get("session_id")
-               or payload.get("conversation_id") or uuid.uuid4().hex)
+               or payload.get("conversation_id") or payload.get("conversationId") or uuid.uuid4().hex)
     with ExitStack() as scope:
         managed = build_workspaces(settings(missing_ok=False))
         if managed is None:
@@ -389,10 +488,37 @@ def artifact_hook(options):
         output = {"env": env, "additional_context": context}
     elif provider in ("codex", "claude"):
         output = {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": context}}
+    elif provider == "antigravity":
+        # Antigravity hooks cannot set the agent's environment; the message tells it what to source.
+        output = {"injectSteps": [{"systemMessage": {"systemMessage": context}}]}
     else:
         output = {"env_file": str(env_file), "env": env, "context": context}
     print(json.dumps(output))
     return 0
+
+
+def antigravity_hook_files():
+    """Antigravity reads ~/.gemini/config; T3 gives each Antigravity instance its own GEMINI_HOME."""
+    homes = [HOME / ".gemini"] if (HOME / ".gemini").is_dir() else []
+    if T3_ANTIGRAVITY_PROFILES.is_dir():
+        homes += sorted(p for p in T3_ANTIGRAVITY_PROFILES.iterdir() if p.is_dir() and not p.is_symlink())
+    return [home / "config/hooks.json" for home in homes]
+
+
+def add_hook(hooks, command, legacy, path, flat, entry):
+    """Add one command hook to an event list, or update an older command in place. True when changed."""
+    matches = [hook for group in hooks
+               for hook in ([group] if flat else group.get("hooks", []))
+               if hook.get("command") in (command, *legacy)]
+    if len(matches) > 1:
+        raise ValueError(f"Multiple AI Butler hooks in {path}; keep just one before installing")
+    if matches and matches[0]["command"] == command:
+        return False
+    if matches:
+        matches[0]["command"] = command
+    else:
+        hooks.append(entry)
+    return True
 
 
 def hook_updates():
@@ -406,25 +532,74 @@ def hook_updates():
             data = read_local_json(path)
         except FileNotFoundError:
             data = {"version": 1} if provider == "cursor" else {}
-        hooks = data.setdefault("hooks", {}).setdefault(
-            "sessionStart" if provider == "cursor" else "SessionStart", [])
+        flat = provider == "cursor"
+        events = data.setdefault("hooks", {})
         command = shlex.join([*SERVICE_COMMAND, "artifact-hook", provider])
-        legacy = shlex.join(["/usr/bin/python3", str(HOME / ".agents/hooks/artifact-storage.py"), provider])
-        matches = [hook for group in hooks
-                   for hook in ([group] if provider == "cursor" else group.get("hooks", []))
-                   if hook.get("command") in (command, legacy)]
-        if len(matches) > 1:
-            raise ValueError(f"Multiple artifact hooks in {path}; keep just one before installing")
-        if matches and matches[0]["command"] == command:
-            continue
-        if matches:
-            matches[0]["command"] = command
-        elif provider == "cursor":
-            hooks.append({"command": command, "timeout": 5})
-        else:
-            hooks.append({"hooks": [{"type": "command", "command": command, "timeout": 5}]})
-        changes.append((path, data))
+        legacy = (shlex.join(["/usr/bin/python3", str(HOME / ".agents/hooks/artifact-storage.py"), provider]),)
+        entry = ({"command": command, "timeout": 5} if flat
+                 else {"hooks": [{"type": "command", "command": command, "timeout": 5}]})
+        changed = add_hook(events.setdefault("sessionStart" if flat else "SessionStart", []),
+                           command, legacy, path, flat, entry)
+        if provider in ("codex", "claude"):
+            guard = shlex.join([*SERVICE_COMMAND, "guard", provider])
+            group = {"hooks": [{"type": "command", "command": guard, "timeout": 5}]}
+            if provider == "claude":
+                group = {"matcher": "Bash", **group}
+            changed |= add_hook(events.setdefault("PreToolUse", []), guard, (), path, False, group)
+        if changed:
+            changes.append((path, data))
+    for path in antigravity_hook_files():
+        try:
+            data = read_local_json(path)
+        except FileNotFoundError:
+            data = {}
+        before = json.dumps(data, sort_keys=True)
+        start = shlex.join([*SERVICE_COMMAND, "artifact-hook", "antigravity"])
+        guard = shlex.join([*SERVICE_COMMAND, "guard", "antigravity"])
+        data[HOOK_NAMES["artifacts"]] = {"SessionStart": [{"type": "command", "command": start, "timeout": 5}]}
+        data[HOOK_NAMES["guard"]] = {"PreToolUse": [{"matcher": "run_command", "hooks": [
+            {"type": "command", "command": guard, "timeout": 5}]}]}
+        if json.dumps(data, sort_keys=True) != before:
+            changes.append((path, data))
     return changes
+
+
+def bare_xcodebuild(command):
+    """True when a shell command runs xcodebuild on a workspace without -derivedDataPath."""
+    text = command.replace("\\\n", " ")
+    for match in XCODEBUILD_CALL.finditer(text):
+        arguments = match.group(1).split()
+        if "-derivedDataPath" in arguments or any(a.startswith("-derivedDataPath=") for a in arguments):
+            continue
+        if arguments and XCODEBUILD_INFO_FLAGS.intersection(arguments):
+            continue
+        return True
+    return False
+
+
+def guard(options):
+    """PreToolUse hook: stop xcodebuild calls in T3 worktrees that would write the shared DerivedData."""
+    try:
+        payload = json.load(sys.stdin)
+    except ValueError:
+        return 0
+    if options.provider == "antigravity":
+        tool = payload.get("toolCall") or {}
+        command = (tool.get("args") or {}).get("CommandLine")
+    else:
+        command = (payload.get("tool_input") or {}).get("command")
+    if isinstance(command, list):
+        command = shlex.join(str(part) for part in command)
+    cwd = Path(payload.get("cwd") or Path.cwd())
+    blocked = (isinstance(command, str) and worktree_of(Path(os.path.realpath(cwd))) is not None
+               and bare_xcodebuild(command))
+    if options.provider == "antigravity":
+        # "ask" keeps Antigravity's own permission flow for every other command.
+        print(json.dumps({"decision": "deny", "reason": GUARD_MESSAGE} if blocked else {"decision": "ask"}))
+    elif blocked:
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                                 "permissionDecisionReason": GUARD_MESSAGE}}))
+    return 0
 
 
 def check_build(workspace, path, expected, owner, grace):
@@ -512,6 +687,10 @@ def inspect_build(cfg, apply, sweep_id, workspace, build, entry):
         reason = check_build(workspace, build, expected, owner, grace)
         if not reason:
             reason = open_or_mounted(build, preserve_evidence=True)
+            if reason == OPEN_FILES:
+                reason = (stop_orphans(build, (build, Path(owner["checkout"])), apply, sweep_id,
+                                       {"kind": "build", "path": str(build), "checkout": owner["checkout"]})
+                          or open_or_mounted(build, preserve_evidence=True))
         if reason:
             entry["reason"] = reason
             return
@@ -795,12 +974,21 @@ def worktree_of(path):
 def candidate_workspaces(checkout, name, listings):
     """Paths in a worktree that Xcode would name `name`: a project, a workspace or a package folder."""
     if checkout not in listings:
-        listed = subprocess.run(["/usr/bin/git", "-C", str(checkout), "ls-files", "-z", "--cached",
-                                 "--others", "--exclude-standard"],
-                                capture_output=True, timeout=120, check=True)
-        listings[checkout] = [Path(os.fsdecode(f)) for f in listed.stdout.split(b"\0") if f]
+        entries = []
+        # Generated projects (Tuist, XcodeGen) are usually gitignored, so list ignored entries too.
+        # --directory folds a fully ignored folder into one "name/" entry and keeps the listing small.
+        for extra in (["--cached"], ["--ignored", "--directory"]):
+            listed = subprocess.run(["/usr/bin/git", "-C", str(checkout), "ls-files", "-z", *extra,
+                                     "--others", "--exclude-standard"],
+                                    capture_output=True, timeout=120, check=True)
+            entries += [os.fsdecode(f) for f in listed.stdout.split(b"\0") if f]
+        listings[checkout] = entries
     found = set()
-    for relative in listings[checkout]:
+    for entry in listings[checkout]:
+        relative = Path(entry)
+        if entry.endswith("/") and relative.name in (name + ".xcodeproj", name + ".xcworkspace"):
+            found.add(checkout / relative)
+            continue
         parent = checkout / relative.parent
         if ((relative.name == "Package.swift" and parent.name == name)
                 or (relative.name == "project.pbxproj" and parent.name == name + ".xcodeproj")
@@ -809,8 +997,13 @@ def candidate_workspaces(checkout, name, listings):
     return found
 
 
-def derived_data_owner(folder, snapshot, listings):
-    """Return the T3 worktree an Xcode DerivedData folder was built from, or (None, reason)."""
+def derived_data_owner(folder, snapshot, listings, owners=None):
+    """Return the T3 worktree an Xcode DerivedData folder was built from, or (None, reason).
+
+    `owners` remembers folders matched by name while their worktree existed, keyed by folder name,
+    so a folder can still be traced after T3 removes the worktree.
+    """
+    owners = {} if owners is None else owners
     name, suffix = DERIVED_FOLDER.fullmatch(folder.name).groups()
     plist = folder / "info.plist"
     if plist.is_file() and not plist.is_symlink():
@@ -820,15 +1013,22 @@ def derived_data_owner(folder, snapshot, listings):
             return None, "info.plist does not match the folder name"
         checkout = worktree_of(Path(os.path.realpath(workspace)))
         return checkout, None if checkout else "built from outside the T3 worktrees"
-    # A build that stops early leaves Logs and SourcePackages without info.plist.
-    owners = set()
+    # A build that stops early, or a query such as -list, leaves Logs and SourcePackages without info.plist.
+    matched = set()
     for checkout in snapshot.threads:
-        if worktree_of(checkout) == checkout and review.directory(checkout):
+        if worktree_of(checkout) == checkout and checkout.is_dir() and review.directory(checkout):
             if any(xcode_path_hash(str(path)) == suffix
                    for path in candidate_workspaces(checkout, name, listings)):
-                owners.add(checkout)
-    if len(owners) == 1:
-        return owners.pop(), None
+                matched.add(checkout)
+    if len(matched) == 1:
+        checkout = matched.pop()
+        owners[folder.name] = {"checkout": str(checkout), "identity": identity(folder)}
+        return checkout, None
+    known = owners.get(folder.name)
+    if not matched and known and known.get("identity") == identity(folder):
+        checkout = Path(known["checkout"])
+        if worktree_of(checkout) == checkout and not checkout.exists():
+            return checkout, None
     return None, "no info.plist and no single T3 worktree matches the folder name"
 
 
@@ -865,6 +1065,13 @@ def sweep_derived_data(cfg, apply, sweep_id, entries):
         entries.append({"kind": "derived-data", "path": str(root), "status": "keep", "reason": str(exc)})
         return
     listings = {}
+    ledger = REPORT.parent / DERIVED_OWNERS
+    try:
+        stored = read_local_json(ledger)
+    except (FileNotFoundError, ValueError):
+        stored = {}
+    owners = {name: value for name, value in stored.items()
+              if isinstance(value, dict) and (root / name).is_dir()}
     for folder in sorted(root.iterdir()):
         if folder.name.startswith(RETIRED_DERIVED):
             entries.append({"kind": "derived-data", "path": str(folder), "status": "staged",
@@ -875,14 +1082,17 @@ def sweep_derived_data(cfg, apply, sweep_id, entries):
         entry = {"kind": "derived-data", "path": str(folder), "status": "keep"}
         entries.append(entry)
         try:
-            inspect_derived(cfg, apply, sweep_id, root, folder, snapshot, listings, entry)
+            inspect_derived(cfg, apply, sweep_id, root, folder, snapshot, listings, entry, owners)
         except (OSError, ValueError, KeyError, TypeError, RuntimeError, plistlib.InvalidFileException,
                 review.sqlite3.Error, subprocess.SubprocessError) as exc:
             entry["reason"] = str(exc)
+    owners = {name: value for name, value in owners.items() if (root / name).is_dir()}
+    if apply and owners != stored:
+        write_json(ledger, owners)
 
 
-def inspect_derived(cfg, apply, sweep_id, root, folder, snapshot, listings, entry):
-    checkout, reason = derived_data_owner(folder, snapshot, listings)
+def inspect_derived(cfg, apply, sweep_id, root, folder, snapshot, listings, entry, owners=None):
+    checkout, reason = derived_data_owner(folder, snapshot, listings, owners)
     if checkout is None:
         entry["reason"] = reason
         return
@@ -890,6 +1100,10 @@ def inspect_derived(cfg, apply, sweep_id, root, folder, snapshot, listings, entr
     grace = cfg["settlement_grace_seconds"]
     expected = identity(folder)
     reason = check_derived(folder, expected, checkout, grace) or open_or_mounted(folder)
+    if reason == OPEN_FILES:
+        reason = (stop_orphans(folder, (folder, checkout), apply, sweep_id,
+                               {"kind": "derived-data", "path": str(folder), "checkout": str(checkout)})
+                  or open_or_mounted(folder))
     if reason:
         entry["reason"] = reason
         return
@@ -920,6 +1134,112 @@ def inspect_derived(cfg, apply, sweep_id, root, folder, snapshot, listings, entr
     if reason:
         entry["reason"] = reason
         if restore_build(parked, folder):
+            entry["status"] = "keep"
+            entry.pop("staged_path")
+        audit("delete_cancelled", sweep_id, **dict(evidence, reason=reason))
+        return
+    try:
+        shutil.rmtree(parked)
+    except OSError as exc:
+        entry["reason"] = str(exc)
+        audit("delete_failed", sweep_id, **dict(evidence, reason=str(exc)))
+        return
+    entry["status"] = "deleted"
+    audit("deleted", sweep_id, **evidence)
+
+
+def check_checkout_build(path, expected, checkout, name, grace):
+    """Reason to keep build output inside a T3 worktree, or None when it can go."""
+    if path.is_symlink() or identity(path) != expected:
+        return "folder was replaced"
+    snapshot = review.load_t3(DB)
+    if snapshot.has_unmapped_legacy_threads or not snapshot.threads.get(checkout):
+        return "no complete T3 ownership for this worktree"
+    if any(review.overlaps(checkout, p) for p in snapshot.projects):
+        return "worktree overlaps a project checkout"
+    reason = settled_threads(snapshot, checkout, grace)
+    if reason or path.name != name:
+        return reason
+    git = ["/usr/bin/git", "-C", str(checkout)]
+    if subprocess.run([*git, "check-ignore", "-q", "--", name], capture_output=True, timeout=60).returncode != 0:
+        return "folder is not ignored by git"
+    tracked = subprocess.run([*git, "ls-files", "-z", "--", name], capture_output=True, timeout=60, check=True)
+    if tracked.stdout:
+        return "folder contains tracked files"
+    return None
+
+
+def sweep_checkout_builds(cfg, apply, sweep_id, entries):
+    """Remove ignored build output that tools left inside settled T3 worktrees.
+
+    A SwiftPM `.build` holds git checkouts, which makes T3 keep the whole worktree, and nothing else
+    removes an in-checkout `DerivedData`. This runs only after the user opted in to build cleanup.
+    """
+    if not cfg.get("build_artifacts_root"):
+        return
+    try:
+        snapshot = review.load_t3(DB)
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError, review.sqlite3.Error) as exc:
+        entries.append({"kind": "checkout-build", "path": str(WORKTREES), "status": "keep", "reason": str(exc)})
+        return
+    grace = cfg["settlement_grace_seconds"]
+    for checkout in sorted(snapshot.threads):
+        if worktree_of(checkout) != checkout or checkout.is_symlink() or not checkout.is_dir():
+            continue
+        for parked in sorted(checkout.glob(RETIRED_DERIVED + "*")):
+            entries.append({"kind": "checkout-build", "path": str(parked), "status": "staged",
+                            "reason": "interrupted cleanup; preserved for manual review"})
+        for name in CHECKOUT_BUILD_NAMES:
+            path = checkout / name
+            if path.is_symlink() or not path.is_dir():
+                continue
+            entry = {"kind": "checkout-build", "path": str(path), "checkout": str(checkout), "status": "keep"}
+            entries.append(entry)
+            try:
+                inspect_checkout_build(apply, sweep_id, checkout, name, grace, entry)
+            except (OSError, ValueError, KeyError, TypeError, RuntimeError,
+                    review.sqlite3.Error, subprocess.SubprocessError) as exc:
+                entry["reason"] = str(exc)
+
+
+def inspect_checkout_build(apply, sweep_id, checkout, name, grace, entry):
+    path = checkout / name
+    expected = identity(path)
+    reason = check_checkout_build(path, expected, checkout, name, grace) or open_or_mounted(path)
+    if reason == OPEN_FILES:
+        reason = (stop_orphans(path, (path, checkout), apply, sweep_id,
+                               {"kind": "checkout-build", "path": str(path), "checkout": str(checkout)})
+                  or open_or_mounted(path))
+    if reason:
+        entry["reason"] = reason
+        return
+    entry["allocated_kib"] = review.size_kib(path)
+    if not apply:
+        entry["status"] = "eligible"
+        return
+    if not sweep_id:
+        raise ValueError("Deletion requires a sweep audit ID")
+    parked = checkout / (RETIRED_DERIVED + uuid.uuid4().hex)
+    evidence = {"kind": "checkout-build", "path": str(path), "checkout": str(checkout),
+                "staged_path": str(parked), "allocated_kib": entry["allocated_kib"],
+                "reason": "ignored build output in a T3 worktree whose threads settled; no detected open files"}
+    audit("delete_intent", sweep_id, **evidence)
+    reason = check_checkout_build(path, expected, checkout, name, grace)
+    if reason:
+        entry["reason"] = reason
+        audit("delete_cancelled", sweep_id, **dict(evidence, reason=reason))
+        return
+    path.rename(parked)
+    entry.update(status="staged", staged_path=str(parked))
+    try:
+        reason = (open_or_mounted(parked) or check_checkout_build(parked, expected, checkout, name, grace)
+                  or ("folder was recreated" if path.exists() or path.is_symlink() else None))
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError,
+            review.sqlite3.Error, subprocess.SubprocessError) as exc:
+        reason = str(exc)
+    if reason:
+        entry["reason"] = reason
+        if restore_build(parked, path):
             entry["status"] = "keep"
             entry.pop("staged_path")
         audit("delete_cancelled", sweep_id, **dict(evidence, reason=reason))
@@ -1084,6 +1404,7 @@ def sweep(cfg, apply, sweep_id=None):
     sweep_project_files(cfg, apply, sweep_id, result["entries"])
     sweep_evidence(cfg, apply, sweep_id, result["entries"])
     sweep_derived_data(cfg, apply, sweep_id, result["entries"])
+    sweep_checkout_builds(cfg, apply, sweep_id, result["entries"])
     return result
 
 
@@ -1306,9 +1627,11 @@ def main():
     commands.add_parser("preview", help="Show current eligibility; remove nothing")
     commands.add_parser("status", help="Show LaunchAgent and last sweep status")
     hook = commands.add_parser("artifact-hook", help="Allocate workspace and run output paths")
-    hook.add_argument("provider", choices=("codex", "claude", "cursor", "other"))
+    hook.add_argument("provider", choices=("codex", "claude", "cursor", "antigravity", "other"))
     hook.add_argument("--cwd")
     hook.add_argument("--session")
+    guarding = commands.add_parser("guard", help="PreToolUse hook: block xcodebuild without -derivedDataPath")
+    guarding.add_argument("provider", choices=("codex", "claude", "antigravity"))
     foreground = commands.add_parser("run", help="Run one foreground command with disposable temp")
     foreground.add_argument("--thread")
     foreground.add_argument("--pool")
@@ -1322,6 +1645,12 @@ def main():
         action = options.action
         if action == "artifact-hook":
             return artifact_hook(options)
+        if action == "guard":
+            try:
+                return guard(options)
+            except Exception as exc:  # A broken guard must never block an agent's tool call.
+                print(f"ai-butler guard: {exc}", file=sys.stderr)
+                return 0
         if action == "run":
             return run(options)
         if action == "status":

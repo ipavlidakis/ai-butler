@@ -2,7 +2,7 @@
 
 AI Butler is a macOS CLI that cleans up temporary files, Xcode DerivedData
 built from T3 worktrees and, with startup hooks enabled, build output owned by
-T3 worktrees. Source worktrees, shared caches, device state, and older
+T3 worktrees, including build output left inside them. Source worktrees, shared caches, device state, and older
 unregistered data stay outside its scope.
 
 ## What is a scratch pool?
@@ -40,9 +40,26 @@ Use `ai-butler preview` to see what a sweep would keep or remove.
 ## Worktree build cleanup
 
 `ai-butler install --hooks` registers the artifact startup hook for Codex,
-Claude Code, and Cursor when their configuration directories exist. If Codex
-asks you to trust the new hook, review it in `/hooks`. Start a fresh agent
-session after installing. Plain `install` does not change provider settings.
+Claude Code, Cursor and Antigravity when their configuration directories
+exist. If Codex asks you to trust the new hook, review it in `/hooks`. Start a
+fresh agent session after installing. Plain `install` does not change provider
+settings.
+
+T3 runs Antigravity with a private profile for each Antigravity instance
+(`~/.t3/userdata/providers/antigravity/<instance>`), which does not read
+`~/.gemini`. `install --hooks` writes the hooks to `~/.gemini/config/hooks.json`
+and to every T3 Antigravity profile that exists. Run it again after you add an
+Antigravity instance in T3. Antigravity hooks cannot set environment
+variables, so its startup hook tells the agent which `env.sh` to source.
+
+For Codex, Claude Code and Antigravity, `install --hooks` also adds a
+PreToolUse guard. It blocks an `xcodebuild` call run from a T3 worktree
+without `-derivedDataPath`, because Xcode would write that output to the
+shared DerivedData folder. This includes `-list`, `-showBuildSettings` and
+`-resolvePackageDependencies`, which resolve packages there. Information
+flags such as `-version` and `-showsdks` pass. The guard reads only the shell
+command line, so a script that calls `xcodebuild` is not checked; the
+DerivedData sweep below still cleans up after it.
 
 The hook creates an `owner.json` that records the checkout path, and an
 `env.sh` with a shared build path for that checkout and separate evidence
@@ -85,9 +102,13 @@ check.
 Xcode names each folder `<Name>-<hash>`, where the hash comes from the path of
 the project, workspace or package that was built. AI Butler finds that path in
 the folder's `info.plist` (`WorkspacePath`) and checks that its hash matches
-the folder name. A build that stops early leaves no `info.plist`. For those
-folders, AI Butler hashes the projects, workspaces and package folders in each
-T3 worktree with that name, and accepts exactly one match.
+the folder name. A build that stops early, or a query such as
+`xcodebuild -list`, leaves no `info.plist`. For those folders, AI Butler hashes
+the projects, workspaces and package folders in each T3 worktree with that
+name, and accepts exactly one match. Gitignored ones count, because tools such
+as Tuist and XcodeGen generate them. AI Butler records each match in
+`derived-data-owners.json` in its state folder, so the folder is still
+attributed after T3 removes the worktree.
 
 A folder is removed only when all of these are true:
 
@@ -103,6 +124,35 @@ results that Xcode stored inside the folder are removed with it, so copy what
 you need first. AI Butler moves the folder aside before the last check, so a
 new build gets a fresh folder. Each deletion gets an intent and an outcome
 record in the audit log.
+
+## Build output inside worktrees
+
+A build run without an output path writes into the checkout: SwiftPM creates
+`.build`, and `xcodebuild -derivedDataPath DerivedData` creates `DerivedData`.
+SwiftPM's `.build` holds git checkouts of dependencies, and T3 keeps any
+worktree that contains a nested git repository. Once you have run
+`install --hooks`, AI Butler removes these two folders from a T3 worktree when
+all of these are true:
+
+- The folder is a real directory, not a symlink into the build cache.
+- Git ignores it and it contains no tracked files.
+- Every T3 thread for the worktree, and its descendants, is settled past the
+  grace period.
+- `lsof` reports no open files in it.
+
+T3 can then apply its own rules to the rest of the worktree. Anything else in
+the checkout is left alone.
+
+## Orphaned processes
+
+A hung test helper or build daemon can outlive the agent that started it. It
+is then re-parented to launchd and keeps files open, which blocks cleanup
+forever. When open files are the only reason to keep a settled build cache,
+DerivedData folder or in-worktree build folder, AI Butler checks every process
+holding it open. It stops them with `SIGTERM` only when each one runs as you,
+has launchd as its parent, and runs from or names the folder or its worktree.
+Otherwise it keeps the folder. It records the processes in a `stop_orphans`
+audit event before stopping them, and removes the folder once they exit.
 
 ## Run evidence retention
 
@@ -217,6 +267,7 @@ while its LaunchAgent is installed.
 | `preview` | List what a sweep would keep or remove, with reasons, without deleting data. |
 | `status` | Show whether the LaunchAgent is loaded and the time and outcome of its last sweep. |
 | `artifact-hook other --cwd <path> --session <id>` | Allocate paths manually for a provider without a startup hook. |
+| `guard <codex\|claude\|antigravity>` | PreToolUse hook installed by `install --hooks`. Reads the tool call on stdin and blocks `xcodebuild` without `-derivedDataPath` in T3 worktrees. |
 
 ## Local settings and data
 
