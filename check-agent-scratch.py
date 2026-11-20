@@ -408,6 +408,110 @@ with tempfile.TemporaryDirectory(dir=args.fixture_parent) as temp:
     for folder in (app, orphan, no_plist):
         assert [e["event"] for e in events if e.get("path") == str(folder)] == ["delete_intent", "deleted"]
 
+    # A gitignored generated workspace (Tuist, XcodeGen) still attributes a folder without info.plist,
+    # and the recorded owner survives T3 removing the worktree.
+    import shutil
+    generated = scratch.WORKTREES / "demo" / "generated"
+    (generated / "Gen.xcworkspace").mkdir(parents=True)
+    (generated / "Gen.xcworkspace" / "contents.xcworkspacedata").write_text("<Workspace/>\n")
+    (generated / ".gitignore").write_text("*.xcworkspace\n")
+    subprocess.run(["git", "init", "-q", str(generated)], check=True)
+    register_thread("gen", None, generated)
+    resolved_only = built(generated / "Gen.xcworkspace", plist=False)
+    assert "not settled" in derived_rows(True)[resolved_only.name]["reason"]
+    ledger = scratch.read_local_json(scratch.REPORT.parent / scratch.DERIVED_OWNERS)
+    assert ledger[resolved_only.name]["checkout"] == str(generated), ledger
+    shutil.rmtree(generated)
+    register_thread("gen", settled_at, generated)
+    row = derived_rows(True)[resolved_only.name]
+    assert row["status"] == "deleted" and row["checkout"] == str(generated), row
+    assert resolved_only.name not in scratch.read_local_json(scratch.REPORT.parent / scratch.DERIVED_OWNERS)
+
+    # Build output left inside a settled worktree: ignored folders go, tracked or unignored ones stay.
+    def checkout_rows(apply):
+        return {Path(r["path"]).name: r for r in scratch.sweep(cfg, apply, sweep_id="cb-fixture")["entries"]
+                if r.get("kind") == "checkout-build" and r.get("checkout") == str(package_tree)}
+    (package_tree / ".gitignore").write_text(".build/\n")
+    (package_tree / ".build" / "checkouts" / "dep" / ".git").mkdir(parents=True)
+    (package_tree / ".build" / "checkouts" / "dep" / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    (package_tree / "DerivedData").mkdir()
+    (package_tree / "DerivedData" / "out.o").write_bytes(b"\0" * 4096)
+    register_thread("pkg", None, package_tree)
+    assert "not settled" in checkout_rows(True)[".build"]["reason"]
+    register_thread("pkg", settled_at, package_tree)
+    with (package_tree / ".build" / "open-fixture").open("w"):
+        assert "open files" in checkout_rows(True)[".build"]["reason"]  # This process is not an orphan.
+    rows = checkout_rows(False)
+    assert rows[".build"]["status"] == "eligible" and "not ignored" in rows["DerivedData"]["reason"], rows
+    # A hung helper re-parented to launchd keeps the folder open; the sweep stops it, then removes it.
+    subprocess.run(["/bin/sh", "-c", "(cd .build && exec /bin/sleep 120 < open-fixture) &"],
+                   cwd=package_tree, check=True)
+    deadline = time.time() + 10
+    while not scratch.open_holders(package_tree / ".build") and time.time() < deadline:
+        time.sleep(0.2)
+    holder, = scratch.open_holders(package_tree / ".build")
+    assert scratch.process_details(holder)[0] == 1, "fixture process should be orphaned"
+    assert "orphaned process" in checkout_rows(False)[".build"]["reason"]
+    rows = checkout_rows(True)
+    assert rows[".build"]["status"] == "deleted" and not (package_tree / ".build").exists(), rows
+    assert (package_tree / "DerivedData").exists() and (package_tree / "Pkg" / "Package.swift").exists()
+    try:
+        os.kill(holder, 0)
+        raise AssertionError("orphaned fixture process is still running")
+    except ProcessLookupError:
+        pass
+    events = [json.loads(line) for path in scratch.AUDIT_DIR.glob("*.jsonl")
+              for line in path.read_text().splitlines()]
+    stopped, = [e for e in events if e["event"] == "stop_orphans"]
+    assert stopped["processes"][0]["pid"] == holder
+    assert [e["event"] for e in events if e.get("path") == str(package_tree / ".build")] == [
+        "stop_orphans", "delete_intent", "deleted"]
+
+    # The xcodebuild guard and provider hooks.
+    for command, blocked in (("cd /x; xcodebuild -list -workspace A.xcworkspace | tail", True),
+                             ("xcodebuild -showBuildSettings -scheme S", True),
+                             ("FOO=1 xcrun xcodebuild -resolvePackageDependencies", True),
+                             ("xcodebuild test -derivedDataPath \"$D\" -scheme S", False),
+                             ("xcodebuild \\\n  -scheme S \\\n  -derivedDataPath $D build", False),
+                             ("xcodebuild -version", False), ("echo $(xcodebuild -showsdks)", False),
+                             ("pgrep -x xcodebuild; sleep 5", False), ("grep -n xcodebuild notes.md", False)):
+        assert scratch.bare_xcodebuild(command) == blocked, command
+    def guarded(provider, payload):
+        out = StringIO()
+        with patch.object(sys, "stdin", StringIO(json.dumps(payload))), redirect_stdout(out):
+            assert scratch.guard(argparse.Namespace(provider=provider)) == 0
+        return json.loads(out.getvalue()) if out.getvalue() else None
+    bare = "xcodebuild -list -workspace A.xcworkspace"
+    assert guarded("claude", {"tool_input": {"command": bare}, "cwd": str(checkout)})[
+        "hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert guarded("claude", {"tool_input": {"command": "ls"}, "cwd": str(checkout)}) is None
+    assert guarded("claude", {"tool_input": {"command": bare}, "cwd": str(base)}) is None  # Not a T3 worktree.
+    agy = {"toolCall": {"name": "run_command", "args": {"CommandLine": bare}}, "cwd": str(checkout)}
+    assert guarded("antigravity", agy)["decision"] == "deny"
+    agy["toolCall"]["args"]["CommandLine"] = "ls"
+    assert guarded("antigravity", agy) == {"decision": "ask"}  # Antigravity treats {} as a denial.
+    output = StringIO()
+    with redirect_stdout(output):
+        assert scratch.artifact_hook(argparse.Namespace(
+            provider="antigravity", cwd=str(checkout), session="agy-fixture")) == 0
+    step, = json.loads(output.getvalue())["injectSteps"]
+    assert "env.sh" in step["systemMessage"]["systemMessage"]
+    for folder in (".claude", ".codex", ".gemini/config"):
+        (base / folder).mkdir(parents=True, exist_ok=True)
+    scratch.T3_ANTIGRAVITY_PROFILES = base / "t3-antigravity"
+    (scratch.T3_ANTIGRAVITY_PROFILES / "instance" / "config").mkdir(parents=True)
+    changes = dict(scratch.hook_updates())
+    claude = changes[base / ".claude/settings.json"]["hooks"]
+    assert claude["PreToolUse"][0]["matcher"] == "Bash" and "guard claude" in json.dumps(claude["PreToolUse"])
+    assert "guard codex" in json.dumps(changes[base / ".codex/hooks.json"]["hooks"]["PreToolUse"])
+    for path in (base / ".gemini/config/hooks.json", scratch.T3_ANTIGRAVITY_PROFILES / "instance/config/hooks.json"):
+        hooks = changes[path]
+        assert "artifact-hook antigravity" in json.dumps(hooks[scratch.HOOK_NAMES["artifacts"]]["SessionStart"])
+        assert hooks[scratch.HOOK_NAMES["guard"]]["PreToolUse"][0]["matcher"] == "run_command"
+    for path, data in changes.items():
+        scratch.write_json(path, data)
+    assert scratch.hook_updates() == []  # Installing again changes nothing.
+
     # Storage report: sizes are recorded per sweep and compared with a fresh measurement.
     grown = base / "grown"
     grown.mkdir()
@@ -432,3 +536,5 @@ print("PASS: hook-allocated build cache, shared owners, evidence, aliases, audit
 print("PASS: project stray files: unsafe patterns, owner attribution, orphans, settlement, grace, open file, audit")
 print("PASS: evidence retention: age, settlement, open file, disabled, preview, audit; storage report history")
 print("PASS: Xcode DerivedData: info.plist and hash attribution, outside and mismatched folders, orphans, settlement, open file, audit")
+print("PASS: ignored generated workspaces, owners kept after worktree removal, in-worktree build output, orphaned holders")
+print("PASS: xcodebuild guard, Antigravity startup hook, and idempotent hook install for every provider")
