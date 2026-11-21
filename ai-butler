@@ -2,6 +2,7 @@
 """Manage temporary files and build output for T3 worktrees on macOS."""
 
 import argparse
+from collections import Counter
 from contextlib import ExitStack, contextmanager
 import ctypes
 from datetime import date, datetime, timedelta, timezone
@@ -391,11 +392,13 @@ def stop_orphans(path, roots, apply, sweep_id, evidence):
 
 
 def open_under(path, reason):
-    processes = subprocess.run(["/bin/ps", "-axww", "-o", "command="], capture_output=True, timeout=10)
+    processes = subprocess.run(["/bin/ps", "-axww", "-o", "pid=,command="], capture_output=True, timeout=10)
     if processes.returncode or processes.stderr or not processes.stdout.strip():
         return "could not inspect process command lines"
+    commands = b"\n".join(line for line in processes.stdout.splitlines()
+                          if line.split(None, 1)[:1] != [str(os.getpid()).encode()])
     for spelling in {os.fsencode(path), os.fsencode(os.path.realpath(path))}:
-        if re.search(re.escape(spelling) + rb"(?:[/\s\x22\x27]|$)", processes.stdout, re.MULTILINE):
+        if re.search(re.escape(spelling) + rb"(?:[/\s\x22\x27]|$)", commands, re.MULTILINE):
             return "a running process names this path on its command line"
     # One system-wide listing stays fast; `lsof +D` walks the tree and timed out on a 45 GB cache.
     opened = subprocess.run(["/usr/sbin/lsof", "-nP", "-F", "n"], capture_output=True, timeout=60)
@@ -527,10 +530,13 @@ def add_hook(hooks, command, legacy, path, flat, entry):
     return True
 
 
-def hook_updates():
+HOOK_FILES = (("codex", ".codex/hooks.json"), ("claude", ".claude/settings.json"), ("cursor", ".cursor/hooks.json"))
+
+
+def hook_updates(command_prefix=None):
+    command_prefix = command_prefix or SERVICE_COMMAND
     changes = []
-    for provider, relative in (("codex", ".codex/hooks.json"), ("claude", ".claude/settings.json"),
-                               ("cursor", ".cursor/hooks.json")):
+    for provider, relative in HOOK_FILES:
         path = HOME / relative
         if not path.parent.is_dir():
             continue
@@ -540,14 +546,14 @@ def hook_updates():
             data = {"version": 1} if provider == "cursor" else {}
         flat = provider == "cursor"
         events = data.setdefault("hooks", {})
-        command = shlex.join([*SERVICE_COMMAND, "artifact-hook", provider])
+        command = shlex.join([*command_prefix, "artifact-hook", provider])
         legacy = (shlex.join(["/usr/bin/python3", str(HOME / ".agents/hooks/artifact-storage.py"), provider]),)
         entry = ({"command": command, "timeout": 5} if flat
                  else {"hooks": [{"type": "command", "command": command, "timeout": 5}]})
         changed = add_hook(events.setdefault("sessionStart" if flat else "SessionStart", []),
                            command, legacy, path, flat, entry)
         if provider in ("codex", "claude"):
-            guard = shlex.join([*SERVICE_COMMAND, "guard", provider])
+            guard = shlex.join([*command_prefix, "guard", provider])
             group = {"hooks": [{"type": "command", "command": guard, "timeout": 5}]}
             if provider == "claude":
                 group = {"matcher": "Bash", **group}
@@ -560,8 +566,8 @@ def hook_updates():
         except FileNotFoundError:
             data = {}
         before = json.dumps(data, sort_keys=True)
-        start = shlex.join([*SERVICE_COMMAND, "artifact-hook", "antigravity"])
-        guard = shlex.join([*SERVICE_COMMAND, "guard", "antigravity"])
+        start = shlex.join([*command_prefix, "artifact-hook", "antigravity"])
+        guard = shlex.join([*command_prefix, "guard", "antigravity"])
         data[HOOK_NAMES["artifacts"]] = {"SessionStart": [{"type": "command", "command": start, "timeout": 5}]}
         data[HOOK_NAMES["guard"]] = {"PreToolUse": [{"matcher": "run_command", "hooks": [
             {"type": "command", "command": guard, "timeout": 5}]}]}
@@ -1489,10 +1495,10 @@ def allocate(cfg, options, command_scope):
     checkout = thread_checkout(review.load_t3(DB), thread)
     cwd = Path.cwd().resolve()
     if cwd != checkout and checkout not in cwd.parents:
-        raise ValueError("Current directory is outside the T3 thread's checkout")
+        raise ValueError(f"Current directory {cwd} is outside the T3 thread's checkout. Run from {checkout}.")
     name = options.pool or next(iter(cfg["pools"]), None)
     if name not in cfg["pools"]:
-        raise ValueError("Pool is not configured")
+        raise ValueError(f"Pool {name!r} is not configured. Run ai-butler list to see registered pools.")
     cmd = options.command
     if cmd and cmd[0] == "--":
         cmd = cmd[1:]
@@ -1632,6 +1638,127 @@ def config_details(cfg):
             "xcode_derived_data": str(xcode_derived_data() or "")}
 
 
+def routing_status(cfg):
+    root = cfg.get("build_artifacts_root")
+    paths = [HOME / relative for _, relative in HOOK_FILES if (HOME / relative).parent.is_dir()]
+    paths.extend(antigravity_hook_files())
+    command = SERVICE_COMMAND
+    if PLIST.is_file():
+        service = plistlib.loads(PLIST.read_bytes())
+        args = service.get("ProgramArguments", [])
+        if service.get("Label") == LABEL and args[-1:] == ["_sweep"]:
+            command = args[:-1]
+    pending = {path for path, _ in hook_updates(command)}
+    session = "No matching run environment in this shell."
+    run = Path(os.environ.get("AGENT_RUN_DIR", ""))
+    if root and run.is_absolute() and run.parent.name == "runs" and within(run.resolve(), Path(root) / "workspaces"):
+        try:
+            owner = read_local_json(run / "owner.json")
+            if owner["checkout"] == os.getenv("AGENT_CHECKOUT") and (run / "env.sh").is_file():
+                session = f"{owner['provider']} run environment loaded from {run}"
+        except (FileNotFoundError, KeyError):
+            pass
+    return {"artifact_root": root, "hooks": {str(p): "needs install --hooks" if p in pending else "configured"
+                                             for p in paths}, "shell_routing": session}
+
+
+def print_routing(routing, written=()):
+    print("Artifact root:", routing["artifact_root"] or "unconfigured")
+    for path, state in routing["hooks"].items():
+        print(f"  {path}  ({'written' if Path(path) in written else state})")
+    if not routing["hooks"]:
+        print("No supported provider profiles found.")
+    print(routing["shell_routing"])
+    if routing["shell_routing"].startswith("No matching"):
+        print("In a fresh agent session, source the env.sh from the startup hook and run ai-butler status --summary.")
+
+
+def display_size(kib):
+    if kib is None:
+        return "size unknown"
+    if kib < 1024:
+        return f"{kib} KiB"
+    if kib < 1048576:
+        return f"{kib / 1024:.1f} MiB"
+    return f"{kib / 1048576:.2f} GiB"
+
+
+def print_preview(entries):
+    eligible = sorted((e for e in entries if e["status"] == "eligible"),
+                      key=lambda e: e.get("allocated_kib") or 0, reverse=True)
+    measured = [e["allocated_kib"] for e in eligible if e.get("allocated_kib") is not None]
+    print(f"Eligible now: {len(eligible)} paths, {display_size(sum(measured))} measured.")
+    if len(measured) < len(eligible):
+        print(f"Size unavailable for {len(eligible) - len(measured)} eligible paths.")
+    if eligible:
+        print("Largest eligible paths (up to five):")
+    for entry in eligible[:5]:
+        print(f"  {display_size(entry.get('allocated_kib'))}  {entry['path']}")
+    reasons = Counter()
+    measured_kept = Counter()
+    for entry in entries:
+        if entry["status"] == "eligible":
+            continue
+        group = (entry["status"], entry.get("reason", "no detail recorded"))
+        reasons[group] += 1
+        if entry.get("allocated_kib") is not None:
+            measured_kept[group] += entry["allocated_kib"]
+    for group, count in reasons.most_common():
+        state, reason = group
+        size = f", {display_size(measured_kept[group])} measured" if group in measured_kept else ""
+        print(f"  {state} ({count}{size})  {reason}")
+    print("Inspect a path with ai-butler explain PATH. For the full list, run ai-butler preview.")
+
+
+def explain(cfg, target, entries):
+    path = target.expanduser().resolve()
+    def match(rows):
+        return max((e for e in rows if e.get("path") and within(path, Path(e["path"]))),
+                   key=lambda e: len(Path(e["path"]).parts), default=None)
+
+    entry = match(entries)
+    try:
+        report = read_local_json(REPORT)
+    except FileNotFoundError:
+        report = {}
+    prior = match(report.get("entries", []))
+    print(path)
+    if entry:
+        print("Rule:", entry.get("kind", "registered scratch"), "at", entry["path"])
+        owner = entry.get("checkout") or entry.get("thread") or entry.get("project")
+        if not owner and entry.get("kind") in ("build", "evidence"):
+            folder = Path(entry["path"])
+            try:
+                owner = read_local_json(folder.parent / "owner.json" if entry["kind"] == "build"
+                                        else folder / "owner.json").get("checkout")
+            except (ValueError, OSError):
+                pass
+        print("Owner:", owner or "unverified")
+        reason = entry.get("reason", "")
+        print("Current decision:", entry["status"], "—", reason or "all eligibility checks passed")
+        if entry["status"] == "eligible":
+            print("Next sweep: eligible if the checks still pass.")
+        elif "not settled" in reason or "grace period" in reason:
+            print(f"Wait for work to finish and all related threads to settle, then allow the "
+                  f"{cfg['settlement_grace_seconds'] // 60}-minute grace period.")
+        elif "not opted in" in reason:
+            print("Automatic cleanup cannot adopt this existing build directory.")
+        elif reason.startswith("evidence changed"):
+            print(f"Evidence must remain unchanged for {cfg['evidence_retention_days']} days.")
+        elif "process" in reason or "open file" in reason:
+            print("Retry preview after the process exits and the process checks succeed.")
+    else:
+        roots = [ROOT, WORKTREES, *filter(None, (build_workspaces(cfg), xcode_derived_data()))]
+        if any(within(path, root) for root in roots):
+            print("No current cleanup rule selected this path.")
+        else:
+            print("Outside managed cleanup paths.")
+    if prior:
+        print("Last sweep:", report.get("generated_at", ""), prior["status"], prior.get("reason", ""))
+    else:
+        print("Last sweep: no recorded decision for this path.")
+
+
 def status():
     result = {"loaded": loaded(), "launch_agent": str(PLIST), "latest_sweep_file": str(REPORT),
               "audit_directory": str(AUDIT_DIR)}
@@ -1672,8 +1799,24 @@ def scheduled_sweep():
 def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(prog="ai-butler", description=__doc__,
-                                     epilog="Start with ai-butler list, then ai-butler preview to see what cleanup would keep or remove.")
-    commands = parser.add_subparsers(dest="action", required=True)
+                                     usage="ai-butler COMMAND [OPTIONS]", formatter_class=argparse.RawDescriptionHelpFormatter,
+                                     epilog="""Everyday use
+  list               Show configured paths and timings
+  preview --summary  Estimate reclaimable space and group retained paths
+  explain PATH       Show ownership, current eligibility and the last sweep decision
+  status --summary   Verify service, provider hooks and shell routing
+  report             Compare storage usage over time
+  run -- COMMAND     Give a foreground command disposable scratch
+
+Setup
+  install, uninstall, add, remove, addProjectCleanup, removeProjectCleanup,
+  setInterval, setSettlementGracePeriod, setLogRetention, setEvidenceRetention
+
+Agent integration
+  artifact-hook, guard
+
+Run ai-butler COMMAND --help for options.""")
+    commands = parser.add_subparsers(prog="ai-butler", dest="action", required=True, help=argparse.SUPPRESS)
     listing = commands.add_parser("list", help="List managed paths and configuration")
     listing.add_argument("--json", action="store_true")
     commands.add_parser("add", help="Register a new or empty pool").add_argument("path")
@@ -1698,8 +1841,11 @@ def main():
         project.add_argument("project", help="Folder name under ~/workspace/worktrees")
         project.add_argument("pattern", help="Canonical directory plus filename glob")
     preview = commands.add_parser("preview", help="Show what cleanup would keep or remove")
-    preview.add_argument("--summary", action="store_true", help="Print a decision and reason per path (default: JSON)")
-    commands.add_parser("status", help="Show LaunchAgent and last sweep status")
+    preview.add_argument("--summary", action="store_true", help="Show eligible totals, largest paths, and counts by keep reason")
+    commands.add_parser("explain", description="Show the cleanup rule, owner and last sweep decision.").add_argument(
+        "path", type=Path, help="A candidate folder or a file inside it")
+    commands.add_parser("status", help="Show service and routing status").add_argument(
+        "--summary", action="store_true", help="Show service, latest sweep and hook routing in plain text")
     hook = commands.add_parser("artifact-hook", help="Allocate workspace and run output paths")
     hook.add_argument("provider", choices=("codex", "claude", "cursor", "antigravity", "other"))
     hook.add_argument("--cwd")
@@ -1729,8 +1875,17 @@ def main():
         if action == "run":
             return run(options)
         if action == "status":
-            configure_storage(settings())
-            print(json.dumps(status(), indent=2))
+            cfg = settings()
+            configure_storage(cfg)
+            result = status()
+            result["routing"] = routing_status(cfg)
+            if options.summary:
+                print("Service:", "loaded" if result["loaded"] else "unloaded")
+                last = result["last_sweep"] or {}
+                print("Last sweep:", last.get("generated_at", "none recorded"), last.get("error", ""))
+                print_routing(result["routing"])
+            else:
+                print(json.dumps(result, indent=2))
             return 0
         if action == "report":
             cfg = settings()
@@ -1741,11 +1896,13 @@ def main():
             else:
                 print_storage_report(result)
             return 0
-        if action in ("list", "preview"):
+        if action in ("list", "preview", "explain"):
             cfg = settings()
             configure_storage(cfg)
             result = config_details(cfg) if action == "list" else sweep(cfg, apply=False)
-            if action == "list" and not options.json:
+            if action == "explain":
+                explain(cfg, options.path, result["entries"])
+            elif action == "list" and not options.json:
                 print(f"Config: {CONFIG}\nSweep: {cfg['interval_minutes']} min; "
                       f"settlement grace: {cfg['settlement_grace_seconds'] // 60} min")
                 print(f"Audit logs: {AUDIT_DIR} ({cfg['log_retention_days']} days)")
@@ -1760,11 +1917,7 @@ def main():
                     print(f"Project {project}: " + ", ".join(patterns))
                 print("\n".join(result["pools"]) or "(no pools configured)")
             elif action == "preview" and options.summary:
-                if not result["entries"]:
-                    print("No cleanup candidates.")
-                for entry in result["entries"]:
-                    reason = entry.get("reason") or "all cleanup checks passed"
-                    print(f"{entry['status']}  {entry.get('path', '')}  ({reason})")
+                print_preview(result["entries"])
             else:
                 print(json.dumps(result, indent=2))
             return 0
@@ -1791,6 +1944,7 @@ def main():
                     configure_service(cfg["interval_minutes"])
                     for path, data in changes:
                         write_json(path, data)
+                    print_routing(routing_status(cfg), {path for path, _ in changes})
                     print("Startup hooks installed. Trust the new Codex hook in /hooks if prompted.")
                 else:
                     if not CONFIG.exists():

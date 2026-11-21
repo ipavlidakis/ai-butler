@@ -7,6 +7,7 @@ import importlib.util
 from importlib.machinery import SourceFileLoader
 import io
 import json
+import os
 from pathlib import Path
 import plistlib
 import subprocess
@@ -23,6 +24,7 @@ spec.loader.exec_module(butler)
 with tempfile.TemporaryDirectory(dir=sys.argv[1]) as temporary:
     base = Path(temporary).resolve()
     butler.HOME = base
+    butler.T3_ANTIGRAVITY_PROFILES = base / "t3-antigravity"
     butler.xcode_derived_data = lambda: base / "DerivedData"  # Never read the real Xcode folder.
     butler.ROOT = base / "scratch"
     butler.CONFIG = base / "config" / "config.json"
@@ -137,7 +139,26 @@ with tempfile.TemporaryDirectory(dir=sys.argv[1]) as temporary:
         butler.write_json(codex, {"hooks": {"SessionStart": [{"hooks": [legacy_hook, other_hook]}]}})
         butler.write_json(claude, {"permissions": {"allow": ["fixture"]}})
         butler.write_json(cursor, {"version": 1, "hooks": {"sessionStart": [{"command": "keep"}]}})
-        cli("install", "--hooks", "--artifact-root", base / "artifacts")
+        receipt = cli("install", "--hooks", "--artifact-root", base / "artifacts")
+        assert str(cursor) in receipt and "(written)" in receipt
+        assert "Artifact root: " + str(base / "artifacts") in receipt
+        with patch.object(sys, "stdin", io.StringIO(json.dumps({"cwd": str(base), "conversationId": "fixture"}))):
+            env = json.loads(cli("artifact-hook", "cursor"))["env"]
+        with patch.dict(os.environ, env):
+            assert "cursor run environment loaded" in cli("status", "--summary")
+        run = Path(env["AGENT_RUN_DIR"])
+        rows = [{"kind": "evidence", "path": str(run), "status": "keep", "reason": "evidence changed within the last 7 days"},
+                {"path": str(pool / "large"), "status": "eligible", "allocated_kib": 2048},
+                {"path": str(pool / "small"), "status": "eligible", "allocated_kib": 1024}]
+        with patch.object(butler, "sweep", return_value={"entries": rows}):
+            summary = cli("preview", "--summary")
+            assert "3.0 MiB measured" in summary and summary.index("/large") < summary.index("/small")
+            butler.write_json(butler.REPORT, {"entries": rows, "generated_at": "fixture-time"})
+            explanation = cli("explain", run / "logs" / "build.log")
+            for expected in ("Rule: evidence", f"Owner: {base}", "unchanged for 7 days", "Last sweep: fixture-time keep"):
+                assert expected in explanation, explanation
+            assert "Outside managed cleanup paths" in cli("explain", base / "unmanaged")
+
         assert not butler.hook_updates()
         cli("install", "--hooks")
         assert butler.settings()["build_artifacts_root"] == str(base / "artifacts")
