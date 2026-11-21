@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Allocate and retire one-command scratch directories on the T3 worker."""
+"""Manage temporary files and build output for T3 worktrees on macOS."""
 
 import argparse
 from contextlib import ExitStack, contextmanager
@@ -391,6 +391,12 @@ def stop_orphans(path, roots, apply, sweep_id, evidence):
 
 
 def open_under(path, reason):
+    processes = subprocess.run(["/bin/ps", "-axww", "-o", "command="], capture_output=True, timeout=10)
+    if processes.returncode or processes.stderr or not processes.stdout.strip():
+        return "could not inspect process command lines"
+    for spelling in {os.fsencode(path), os.fsencode(os.path.realpath(path))}:
+        if re.search(re.escape(spelling) + rb"(?:[/\s\x22\x27]|$)", processes.stdout, re.MULTILINE):
+            return "a running process names this path on its command line"
     # One system-wide listing stays fast; `lsof +D` walks the tree and timed out on a 45 GB cache.
     opened = subprocess.run(["/usr/sbin/lsof", "-nP", "-F", "n"], capture_output=True, timeout=60)
     if opened.returncode != 0 or opened.stderr:
@@ -1148,6 +1154,70 @@ def inspect_derived(cfg, apply, sweep_id, root, folder, snapshot, listings, entr
     audit("deleted", sweep_id, **evidence)
 
 
+def dependency_reason(path, checkout, name):
+    """Preserve Git data unless the cache contains only reproducible SwiftPM clones."""
+    layout = path if name == ".build" else path / "SourcePackages"
+    pins = None
+
+    def git(repo, *args):
+        return subprocess.run(["/usr/bin/git", "--no-optional-locks", "-C", str(repo), *args],
+                              capture_output=True, check=True, timeout=60).stdout.strip()
+
+    def unreadable(error):
+        raise error
+
+    for base, dirs, files in os.walk(path, onerror=unreadable):
+        repo = Path(base)
+        bare = "HEAD" in files and "objects" in dirs
+        if ".git" not in dirs + files and not bare:
+            continue
+        label = repo.relative_to(path)
+        parent = "repositories" if bare else "checkouts"
+        if repo.parent != layout / parent or (not bare and ".git" not in dirs):
+            return f"unexpected Git repository at {label}"
+        if pins is None:
+            lock = checkout / "Package.resolved"
+            if not lock.is_file() and name == "DerivedData":
+                locks = list(checkout.glob("*.xcworkspace/xcshareddata/swiftpm/Package.resolved"))
+                if not locks:
+                    locks = list(checkout.glob("*.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved"))
+                if len(locks) == 1:
+                    lock = locks[0]
+            if not lock.is_file():
+                return f"cannot verify {label} without Package.resolved"
+            resolved = json.loads(lock.read_text())
+            if not isinstance(resolved, dict) or resolved.get("version") not in (2, 3):
+                return f"unsupported Package.resolved format for {label}"
+            pins = resolved.get("pins")
+            if not isinstance(pins, list) or not all(isinstance(pin, dict) for pin in pins):
+                return f"invalid dependency pins for {label}"
+        origin = os.fsdecode(git(repo, "remote", "get-url", "origin"))
+        logical_layout = checkout / name / layout.relative_to(path)
+        if not bare and Path(origin).parent == logical_layout / "repositories":
+            origin = os.fsdecode(git(layout / "repositories" / Path(origin).name, "remote", "get-url", "origin"))
+        matches = [pin for pin in pins if pin.get("location") == origin and
+                   (bare or str(pin.get("identity", "")).lower() == repo.name.lower())]
+        if len(matches) != 1 or not re.match(r"^(https?://|ssh://|git@)", origin):
+            return f"{label} has no matching remote dependency in Package.resolved"
+        revision = matches[0]["state"]["revision"]
+        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", revision):
+            return f"invalid dependency revision for {label}"
+        metadata = repo if bare else repo / ".git"
+        if (metadata / "worktrees").exists() or git(repo, "for-each-ref", "refs/stash"):
+            return f"{label} has a linked worktree or stash"
+        if git(repo, "rev-list", "-1", "--all", "--reflog", "--not", revision):
+            return f"{label} contains history outside its pinned revision"
+        if bare:
+            dirs.clear()
+            continue
+        if (git(repo, "rev-parse", "HEAD").decode() != revision or
+                git(repo, "status", "--porcelain", "--ignored", "--untracked-files=all", "--ignore-submodules=none") or
+                re.search(rb"(?:^|\x00)[a-zS] ", git(repo, "ls-files", "-vz"))):
+            return f"{label} has local changes or differs from its pinned revision"
+        dirs.remove(".git")
+    return None
+
+
 def check_checkout_build(path, expected, checkout, name, grace):
     """Reason to keep build output inside a T3 worktree, or None when it can go."""
     if path.is_symlink() or identity(path) != expected:
@@ -1158,15 +1228,17 @@ def check_checkout_build(path, expected, checkout, name, grace):
     if any(review.overlaps(checkout, p) for p in snapshot.projects):
         return "worktree overlaps a project checkout"
     reason = settled_threads(snapshot, checkout, grace)
-    if reason or path.name != name:
+    if reason:
         return reason
+    if path.name != name:
+        return dependency_reason(path, checkout, name)
     git = ["/usr/bin/git", "-C", str(checkout)]
     if subprocess.run([*git, "check-ignore", "-q", "--", name], capture_output=True, timeout=60).returncode != 0:
         return "folder is not ignored by git"
     tracked = subprocess.run([*git, "ls-files", "-z", "--", name], capture_output=True, timeout=60, check=True)
     if tracked.stdout:
         return "folder contains tracked files"
-    return None
+    return dependency_reason(path, checkout, name)
 
 
 def sweep_checkout_builds(cfg, apply, sweep_id, entries):
@@ -1599,7 +1671,8 @@ def scheduled_sweep():
 
 def main():
     os.umask(0o077)
-    parser = argparse.ArgumentParser(prog="ai-butler", description=__doc__)
+    parser = argparse.ArgumentParser(prog="ai-butler", description=__doc__,
+                                     epilog="Start with ai-butler list, then ai-butler preview to see what cleanup would keep or remove.")
     commands = parser.add_subparsers(dest="action", required=True)
     listing = commands.add_parser("list", help="List managed paths and configuration")
     listing.add_argument("--json", action="store_true")
@@ -1624,7 +1697,8 @@ def main():
         project = commands.add_parser(name, help=text)
         project.add_argument("project", help="Folder name under ~/workspace/worktrees")
         project.add_argument("pattern", help="Canonical directory plus filename glob")
-    commands.add_parser("preview", help="Show current eligibility; remove nothing")
+    preview = commands.add_parser("preview", help="Show what cleanup would keep or remove")
+    preview.add_argument("--summary", action="store_true", help="Print a decision and reason per path (default: JSON)")
     commands.add_parser("status", help="Show LaunchAgent and last sweep status")
     hook = commands.add_parser("artifact-hook", help="Allocate workspace and run output paths")
     hook.add_argument("provider", choices=("codex", "claude", "cursor", "antigravity", "other"))
@@ -1633,8 +1707,9 @@ def main():
     guarding = commands.add_parser("guard", help="PreToolUse hook: block xcodebuild without -derivedDataPath")
     guarding.add_argument("provider", choices=("codex", "claude", "antigravity"))
     foreground = commands.add_parser("run", help="Run one foreground command with disposable temp")
-    foreground.add_argument("--thread")
-    foreground.add_argument("--pool")
+    foreground.description = "From a T3 checkout, run: ai-butler run -- COMMAND [ARG ...]"
+    foreground.add_argument("--thread", help="T3 thread ID when the environment does not supply one")
+    foreground.add_argument("--pool", help="Registered scratch pool to use (default: tmp)")
     foreground.add_argument("command", nargs=argparse.REMAINDER)
     try:
         if sys.argv[1:] == ["_sweep"]:
@@ -1684,6 +1759,12 @@ def main():
                 for project, patterns in sorted(result["project_cleanup"].items()):
                     print(f"Project {project}: " + ", ".join(patterns))
                 print("\n".join(result["pools"]) or "(no pools configured)")
+            elif action == "preview" and options.summary:
+                if not result["entries"]:
+                    print("No cleanup candidates.")
+                for entry in result["entries"]:
+                    reason = entry.get("reason") or "all cleanup checks passed"
+                    print(f"{entry['status']}  {entry.get('path', '')}  ({reason})")
             else:
                 print(json.dumps(result, indent=2))
             return 0
@@ -1760,4 +1841,8 @@ def main():
 
 
 if __name__ == "__main__":
+    # End quietly when a reader such as head closes the report pipe.
+    if sys.argv[1:2] in (["preview"], ["report"], ["list"]):
+        import signal
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     sys.exit(main())

@@ -151,3 +151,38 @@ with tempfile.TemporaryDirectory(dir=sys.argv[1]) as temporary:
         cli("uninstall", code=1)
         assert butler.PLIST.exists()
 print("PASS: CLI pool boundaries, defaults, timings, service lifecycle, rollback, and reports")
+
+with tempfile.TemporaryDirectory(dir=sys.argv[1]) as fixture:
+    checkout = Path(fixture).resolve()
+    build = checkout / ".build"
+    repo = build / "checkouts" / "sample"
+    repo.mkdir(parents=True)
+    origin = "https://example.org/sample.git"
+
+    def git(*args):
+        return subprocess.check_output(["git", "-C", str(repo), *args], text=True).strip()
+
+    git("init", "-q")
+    git("-c", "user.name=Fixture", "-c", "user.email=test@example.org", "commit", "--allow-empty", "-qm", "pin")
+    git("remote", "add", "origin", origin)
+    pin = {"identity": "sample", "location": origin, "state": {"revision": git("rev-parse", "HEAD")}}
+    (checkout / "Package.resolved").write_text(json.dumps({"version": 3, "pins": [pin]}))
+    assert butler.dependency_reason(build, checkout, ".build") is None
+    mirror = build / "repositories" / "sample-cache"
+    mirror.parent.mkdir()
+    subprocess.run(["git", "clone", "-q", "--bare", str(repo), str(mirror)], check=True)
+    subprocess.run(["git", "-C", str(mirror), "remote", "set-url", "origin", origin], check=True)
+    git("remote", "set-url", "origin", str(mirror))
+    assert butler.dependency_reason(build, checkout, ".build") is None
+    parked = checkout / "staged"
+    build.rename(parked)
+    assert butler.dependency_reason(parked, checkout, ".build") is None
+    parked.rename(build)
+    (repo / "personal.txt").touch()
+    assert "local changes" in butler.dependency_reason(build, checkout, ".build")
+    with subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", str(build)]) as child:
+        try:
+            assert "command line" in butler.open_under(build, butler.OPEN_FILES)
+        finally:
+            child.terminate()
+print("PASS: pinned dependency, untracked dependency edit, and command-line-only path reference")

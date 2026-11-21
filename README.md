@@ -5,6 +5,14 @@ built from T3 worktrees and, with startup hooks enabled, build output owned by
 T3 worktrees, including build output left inside them. Source worktrees, shared caches, device state, and older
 unregistered data stay outside its scope.
 
+## First run
+
+1. Run `ai-butler list` to find the configured storage paths and cleanup interval.
+2. Run `ai-butler preview --summary` to see each cleanup decision and its reason. Plain `preview` prints JSON for scripts.
+3. Run `ai-butler install --hooks` to enable scheduled cleanup and route build output from new agent sessions. Check the service with `ai-butler status`.
+
+A process that names a candidate's absolute path on its command line can keep it in use even with no open file. Preview identifies this reason. For ignored in-worktree build folders, AI Butler also checks nested Git repositories. A SwiftPM checkout must match its lockfile revision and remote, with clean files and verifiable history. Extra branch history, including history in a mirror outside the pinned commit's ancestry, keeps the cache for review.
+
 ## What is a scratch pool?
 
 A **scratch pool** is a folder AI Butler checks for temporary job folders.

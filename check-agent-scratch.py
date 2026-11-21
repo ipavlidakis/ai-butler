@@ -439,6 +439,8 @@ with tempfile.TemporaryDirectory(dir=args.fixture_parent) as temp:
     register_thread("pkg", None, package_tree)
     assert "not settled" in checkout_rows(True)[".build"]["reason"]
     register_thread("pkg", settled_at, package_tree)
+    assert "Package.resolved" in checkout_rows(True)[".build"]["reason"]
+    shutil.rmtree(package_tree / ".build" / "checkouts")
     with (package_tree / ".build" / "open-fixture").open("w"):
         assert "open files" in checkout_rows(True)[".build"]["reason"]  # This process is not an orphan.
     rows = checkout_rows(False)
