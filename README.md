@@ -5,6 +5,32 @@ built from T3 worktrees and, with startup hooks enabled, build output owned by
 T3 worktrees, including build output left inside them. Source worktrees, shared caches, device state, and older
 unregistered data stay outside its scope.
 
+## Install
+
+Requires macOS, a logged-in user session, Python 3.9 or later, and a local T3
+installation. No Python packages are required.
+
+~~~sh
+brew tap ipavlidakis/tap
+brew trust --formula ipavlidakis/tap/ai-butler
+brew install ipavlidakis/tap/ai-butler
+~~~
+
+Only use the trust command on Homebrew versions that require formula trust.
+`ai-butler install` registers the per-user LaunchAgent. Run
+`ai-butler uninstall` before removing the formula with Homebrew.
+
+For a source checkout, use `./ai-butler` and keep the checkout at a stable path
+while its LaunchAgent is installed.
+
+## First run
+
+1. Run `ai-butler list` to find the configured storage paths and cleanup interval.
+2. Run `ai-butler preview --summary` for reclaimable space, the five largest eligible paths and grouped keep reasons. Use `ai-butler explain PATH` for one folder or a file inside it. Plain `preview` prints JSON for scripts.
+3. Run `ai-butler install --hooks` to enable scheduled cleanup and route build output from new agent sessions. In a fresh agent session, source the hook-provided `env.sh` and run `ai-butler status --summary` to verify the service, provider hooks and loaded run environment.
+
+A process that names a candidate's absolute path on its command line can keep it in use even with no open file. Preview identifies this reason. For ignored in-worktree build folders, AI Butler also checks nested Git repositories. A SwiftPM checkout must match its lockfile revision and remote, with clean files and verifiable history. Extra branch history, including history in a mirror outside the pinned commit's ancestry, keeps the cache for review.
+
 ## What is a scratch pool?
 
 A **scratch pool** is a folder AI Butler checks for temporary job folders.
@@ -226,26 +252,6 @@ orphaned and is removed. Files that name no worktree or several worktrees are
 kept, and so is a worktree that still exists without a T3 thread. Deletions use
 the same intent and outcome audit records as the other cleanup.
 
-## Install
-
-Requires macOS, a logged-in user session, Python 3.9 or later, and a local T3
-installation. No Python packages are required.
-
-~~~sh
-brew tap ipavlidakis/tap
-brew trust --formula ipavlidakis/tap/ai-butler
-brew install ipavlidakis/tap/ai-butler
-ai-butler install
-ai-butler status
-~~~
-
-Only use the trust command on Homebrew versions that require formula trust.
-`ai-butler install` registers the per-user LaunchAgent. Run
-`ai-butler uninstall` before removing the formula with Homebrew.
-
-For a source checkout, use `./ai-butler` and keep the checkout at a stable path
-while its LaunchAgent is installed.
-
 ## Commands
 
 | Command | Behavior |
@@ -264,8 +270,9 @@ while its LaunchAgent is installed.
 | `report [--since <time>] [--json]` | Show the growth of known large storage locations since a recorded sweep. Removes nothing. |
 | `setLogRetention <days>` | Keep that many calendar days of audit logs, including today (UTC). Default: seven. Expired logs are removed on the next scheduled sweep. |
 | `run [--thread <id>] [--pool <name>] -- <command>` | From the T3 checkout, opt in one foreground command. Uses `T3CODE_THREAD_ID` by default. |
-| `preview` | List what a sweep would keep or remove, with reasons, without deleting data. |
-| `status` | Show whether the LaunchAgent is loaded and the time and outcome of its last sweep. |
+| `explain <path>` | Show the matching rule, owner, eligibility and last recorded sweep decision. |
+| `preview [--summary]` | List what a sweep would keep or remove, with reasons, without deleting data. |
+| `status [--summary]` | Show whether the LaunchAgent is loaded and the time and outcome of its last sweep. |
 | `artifact-hook other --cwd <path> --session <id>` | Allocate paths manually for a provider without a startup hook. |
 | `guard <codex\|claude\|antigravity>` | PreToolUse hook installed by `install --hooks`. Reads the tool call on stdin and blocks `xcodebuild` without `-derivedDataPath` in T3 worktrees. |
 

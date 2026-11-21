@@ -7,6 +7,7 @@ import importlib.util
 from importlib.machinery import SourceFileLoader
 import io
 import json
+import os
 from pathlib import Path
 import plistlib
 import subprocess
@@ -23,6 +24,7 @@ spec.loader.exec_module(butler)
 with tempfile.TemporaryDirectory(dir=sys.argv[1]) as temporary:
     base = Path(temporary).resolve()
     butler.HOME = base
+    butler.T3_ANTIGRAVITY_PROFILES = base / "t3-antigravity"
     butler.xcode_derived_data = lambda: base / "DerivedData"  # Never read the real Xcode folder.
     butler.ROOT = base / "scratch"
     butler.CONFIG = base / "config" / "config.json"
@@ -137,7 +139,26 @@ with tempfile.TemporaryDirectory(dir=sys.argv[1]) as temporary:
         butler.write_json(codex, {"hooks": {"SessionStart": [{"hooks": [legacy_hook, other_hook]}]}})
         butler.write_json(claude, {"permissions": {"allow": ["fixture"]}})
         butler.write_json(cursor, {"version": 1, "hooks": {"sessionStart": [{"command": "keep"}]}})
-        cli("install", "--hooks", "--artifact-root", base / "artifacts")
+        receipt = cli("install", "--hooks", "--artifact-root", base / "artifacts")
+        assert str(cursor) in receipt and "(written)" in receipt
+        assert "Artifact root: " + str(base / "artifacts") in receipt
+        with patch.object(sys, "stdin", io.StringIO(json.dumps({"cwd": str(base), "conversationId": "fixture"}))):
+            env = json.loads(cli("artifact-hook", "cursor"))["env"]
+        with patch.dict(os.environ, env):
+            assert "cursor run environment loaded" in cli("status", "--summary")
+        run = Path(env["AGENT_RUN_DIR"])
+        rows = [{"kind": "evidence", "path": str(run), "status": "keep", "reason": "evidence changed within the last 7 days"},
+                {"path": str(pool / "large"), "status": "eligible", "allocated_kib": 2048},
+                {"path": str(pool / "small"), "status": "eligible", "allocated_kib": 1024}]
+        with patch.object(butler, "sweep", return_value={"entries": rows}):
+            summary = cli("preview", "--summary")
+            assert "3.0 MiB measured" in summary and summary.index("/large") < summary.index("/small")
+            butler.write_json(butler.REPORT, {"entries": rows, "generated_at": "fixture-time"})
+            explanation = cli("explain", run / "logs" / "build.log")
+            for expected in ("Rule: evidence", f"Owner: {base}", "unchanged for 7 days", "Last sweep: fixture-time keep"):
+                assert expected in explanation, explanation
+            assert "Outside managed cleanup paths" in cli("explain", base / "unmanaged")
+
         assert not butler.hook_updates()
         cli("install", "--hooks")
         assert butler.settings()["build_artifacts_root"] == str(base / "artifacts")
@@ -151,3 +172,38 @@ with tempfile.TemporaryDirectory(dir=sys.argv[1]) as temporary:
         cli("uninstall", code=1)
         assert butler.PLIST.exists()
 print("PASS: CLI pool boundaries, defaults, timings, service lifecycle, rollback, and reports")
+
+with tempfile.TemporaryDirectory(dir=sys.argv[1]) as fixture:
+    checkout = Path(fixture).resolve()
+    build = checkout / ".build"
+    repo = build / "checkouts" / "sample"
+    repo.mkdir(parents=True)
+    origin = "https://example.org/sample.git"
+
+    def git(*args):
+        return subprocess.check_output(["git", "-C", str(repo), *args], text=True).strip()
+
+    git("init", "-q")
+    git("-c", "user.name=Fixture", "-c", "user.email=test@example.org", "commit", "--allow-empty", "-qm", "pin")
+    git("remote", "add", "origin", origin)
+    pin = {"identity": "sample", "location": origin, "state": {"revision": git("rev-parse", "HEAD")}}
+    (checkout / "Package.resolved").write_text(json.dumps({"version": 3, "pins": [pin]}))
+    assert butler.dependency_reason(build, checkout, ".build") is None
+    mirror = build / "repositories" / "sample-cache"
+    mirror.parent.mkdir()
+    subprocess.run(["git", "clone", "-q", "--bare", str(repo), str(mirror)], check=True)
+    subprocess.run(["git", "-C", str(mirror), "remote", "set-url", "origin", origin], check=True)
+    git("remote", "set-url", "origin", str(mirror))
+    assert butler.dependency_reason(build, checkout, ".build") is None
+    parked = checkout / "staged"
+    build.rename(parked)
+    assert butler.dependency_reason(parked, checkout, ".build") is None
+    parked.rename(build)
+    (repo / "personal.txt").touch()
+    assert "local changes" in butler.dependency_reason(build, checkout, ".build")
+    with subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", str(build)]) as child:
+        try:
+            assert "command line" in butler.open_under(build, butler.OPEN_FILES)
+        finally:
+            child.terminate()
+print("PASS: pinned dependency, untracked dependency edit, and command-line-only path reference")
